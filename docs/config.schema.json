@@ -1,0 +1,467 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "AuditConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "result_bytes": {
+          "default": 256000,
+          "description": "Bytes of each tool result kept in the audit log for the dashboard.",
+          "title": "Result Bytes",
+          "type": "integer"
+        },
+        "retention_days": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 30,
+          "description": "Audit events and background process logs older than this many days are deleted when the server starts. `null` keeps everything.",
+          "title": "Retention Days"
+        }
+      },
+      "title": "AuditConfig",
+      "type": "object"
+    },
+    "LimitsConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "default_timeout_s": {
+          "default": 120.0,
+          "description": "Command timeout in seconds when the agent does not set one.",
+          "title": "Default Timeout S",
+          "type": "number"
+        },
+        "max_timeout_s": {
+          "default": 3600.0,
+          "description": "Longest timeout in seconds the agent may ask for.",
+          "title": "Max Timeout S",
+          "type": "number"
+        },
+        "max_output_bytes": {
+          "default": 200000,
+          "description": "Bytes of command output returned to the agent; the middle is cut out beyond this.",
+          "title": "Max Output Bytes",
+          "type": "integer"
+        },
+        "max_read_bytes": {
+          "default": 2000000,
+          "description": "Largest file or HTTP body, in bytes, that read tools return.",
+          "title": "Max Read Bytes",
+          "type": "integer"
+        },
+        "max_processes": {
+          "default": 32,
+          "description": "Most background processes that may run at the same time.",
+          "title": "Max Processes",
+          "type": "integer"
+        },
+        "memory_mb": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Memory cap in MiB for each command and background process. Swap is not allowed, so past the cap the kernel kills the command. Enforced with a systemd user scope (`systemd-run --user`); the server refuses to start if that does not work. `null` means no cap.",
+          "title": "Memory Mb"
+        },
+        "max_pids": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Most processes and threads each command may have at once, counting the two that bubblewrap itself uses; further forks fail. JVM and Node runtimes start many threads, so leave room. Enforced like `memory_mb`. `null` means no cap.",
+          "title": "Max Pids"
+        }
+      },
+      "title": "LimitsConfig",
+      "type": "object"
+    },
+    "SandboxConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "backend": {
+          "default": "auto",
+          "description": "How agent commands are isolated. `bubblewrap` confines them to the workspace (Linux only); `none` runs them with full access to your machine, like a coding agent run directly. `auto` uses bubblewrap and refuses to start when it cannot run here (not Linux, `bwrap` missing, or user namespaces blocked); it never falls back to `none`.",
+          "enum": [
+            "auto",
+            "bubblewrap",
+            "none"
+          ],
+          "title": "Backend",
+          "type": "string"
+        },
+        "network": {
+          "default": true,
+          "description": "Allow network access inside the sandbox.",
+          "title": "Network",
+          "type": "boolean"
+        },
+        "ro_paths": {
+          "description": "Host paths mounted read-only inside the sandbox in addition to the system folders. Missing paths are skipped, so one config works across machines.",
+          "items": {
+            "type": "string"
+          },
+          "title": "Ro Paths",
+          "type": "array",
+          "default": [
+            "~/.nvm",
+            "~/.local/bin",
+            "~/.local/share/uv/python",
+            "~/.sdkman",
+            "~/.cargo/bin",
+            "~/.rustup",
+            "~/go",
+            "~/.pyenv",
+            "~/.bun",
+            "~/.deno"
+          ]
+        },
+        "rw_paths": {
+          "description": "Host paths mounted read-write. Anything here is reachable by the agent.",
+          "items": {
+            "type": "string"
+          },
+          "title": "Rw Paths",
+          "type": "array",
+          "default": []
+        },
+        "env_passthrough": {
+          "description": "Host environment variables copied into the sandbox. Everything else is dropped so server secrets do not leak into agent commands.",
+          "items": {
+            "type": "string"
+          },
+          "title": "Env Passthrough",
+          "type": "array",
+          "default": [
+            "LANG",
+            "LC_ALL",
+            "TZ",
+            "JAVA_HOME",
+            "MAVEN_HOME",
+            "GOPATH",
+            "NVM_DIR"
+          ]
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Extra environment variables for agent commands. Values must be strings: quote numbers in YAML.",
+          "title": "Env",
+          "type": "object",
+          "default": {}
+        }
+      },
+      "title": "SandboxConfig",
+      "type": "object"
+    },
+    "ServerConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "host": {
+          "default": "127.0.0.1",
+          "description": "Address to bind. Auth `none` is only allowed on a loopback address.",
+          "title": "Host",
+          "type": "string"
+        },
+        "port": {
+          "default": 8765,
+          "description": "TCP port to listen on.",
+          "maximum": 65535,
+          "minimum": 1,
+          "title": "Port",
+          "type": "integer"
+        },
+        "auth": {
+          "default": "path-token",
+          "description": "How MCP clients prove access. `path-token` puts a secret token in the URL path, `bearer` expects an `Authorization: Bearer` header, `none` turns auth off (loopback only).",
+          "enum": [
+            "path-token",
+            "bearer",
+            "none"
+          ],
+          "title": "Auth",
+          "type": "string"
+        },
+        "token": {
+          "default": "",
+          "description": "Fixed token for `path-token` and `bearer` auth. Empty means a new random token on every start. At least 16 characters, using only letters, digits, `-`, `_`, `.` and `~`.",
+          "title": "Token",
+          "type": "string"
+        },
+        "public_url": {
+          "default": "",
+          "description": "Public base URL when the server sits behind a tunnel or proxy (e.g. `https://x.trycloudflare.com`). Its hostname is accepted automatically and the banner prints public URLs. Not allowed with auth `none`.",
+          "title": "Public Url",
+          "type": "string"
+        },
+        "allowed_hosts": {
+          "description": "Extra Host header values to accept, e.g. a tunnel hostname. Exact match, or `host:*` for any port. Not allowed with auth `none`.",
+          "items": {
+            "type": "string"
+          },
+          "title": "Allowed Hosts",
+          "type": "array",
+          "default": []
+        }
+      },
+      "title": "ServerConfig",
+      "type": "object"
+    },
+    "ToolsConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "description": "Groups to turn on that are off by default: the opt-in group `docker` and installed plugins.",
+          "items": {
+            "type": "string"
+          },
+          "title": "Enabled",
+          "type": "array",
+          "default": []
+        },
+        "disabled": {
+          "description": "Tool groups to turn off, e.g. `http` or `browser`.",
+          "items": {
+            "type": "string"
+          },
+          "title": "Disabled",
+          "type": "array",
+          "default": []
+        },
+        "disabled_tools": {
+          "description": "Single tools to remove, e.g. `run_command`. Names of tools in a group that is turned off or not installed are ignored, so one list works across machines.",
+          "items": {
+            "type": "string"
+          },
+          "title": "Disabled Tools",
+          "type": "array",
+          "default": []
+        }
+      },
+      "title": "ToolsConfig",
+      "type": "object"
+    },
+    "NoSettings": {
+      "additionalProperties": false,
+      "description": "Settings of a group that has none: any key under `groups.<name>` is an error.",
+      "properties": {},
+      "title": "NoSettings",
+      "type": "object"
+    },
+    "ProjectSettings": {
+      "additionalProperties": false,
+      "properties": {
+        "long_timeout_s": {
+          "default": 600.0,
+          "description": "Timeout in seconds for install_deps, run_tests and run_build when the agent does not set one. `limits.max_timeout_s` still caps it.",
+          "exclusiveMinimum": 0,
+          "title": "Long Timeout S",
+          "type": "number"
+        }
+      },
+      "title": "ProjectSettings",
+      "type": "object"
+    },
+    "HttpSettings": {
+      "additionalProperties": false,
+      "properties": {
+        "default_timeout_s": {
+          "default": 30.0,
+          "description": "Total timeout in seconds for http_request, fetch_url and download_file when the agent does not set one. Must not exceed `limits.max_timeout_s`.",
+          "exclusiveMinimum": 0,
+          "title": "Default Timeout S",
+          "type": "number"
+        },
+        "download_max_bytes": {
+          "default": 100000000,
+          "description": "Largest download_file result in bytes when the agent does not set one.",
+          "exclusiveMinimum": 0,
+          "title": "Download Max Bytes",
+          "type": "integer"
+        },
+        "max_redirects": {
+          "default": 10,
+          "description": "Most redirects a request follows before it fails.",
+          "minimum": 0,
+          "title": "Max Redirects",
+          "type": "integer"
+        }
+      },
+      "title": "HttpSettings",
+      "type": "object"
+    },
+    "DockerSettings": {
+      "additionalProperties": false,
+      "properties": {
+        "build_timeout_s": {
+          "default": 600.0,
+          "description": "Timeout in seconds for docker_build, docker_compose and a detached docker_run (which may pull an image) when the agent does not set one. `limits.max_timeout_s` still caps it.",
+          "exclusiveMinimum": 0,
+          "title": "Build Timeout S",
+          "type": "number"
+        }
+      },
+      "title": "DockerSettings",
+      "type": "object"
+    },
+    "BrowserSettings": {
+      "additionalProperties": false,
+      "properties": {
+        "headless": {
+          "default": true,
+          "description": "Run Chromium without a window. Set to false to watch the agent work on a desktop.",
+          "title": "Headless",
+          "type": "boolean"
+        },
+        "max_pages": {
+          "default": 10,
+          "description": "Most pages, popups included, that may be open at once.",
+          "minimum": 1,
+          "title": "Max Pages",
+          "type": "integer"
+        },
+        "default_timeout_s": {
+          "default": 15.0,
+          "description": "Seconds a browser action waits (for an element, a load, a script) when the agent does not set a timeout. `limits.max_timeout_s` still caps it.",
+          "exclusiveMinimum": 0,
+          "title": "Default Timeout S",
+          "type": "number"
+        },
+        "idle_timeout_s": {
+          "default": 300.0,
+          "description": "Seconds without any browser tool call after which all pages, Chromium and the Playwright driver are closed to free their memory. The next browser call starts them again; pages open at the time must be opened again. 0 keeps them running until the server stops.",
+          "minimum": 0,
+          "title": "Idle Timeout S",
+          "type": "number"
+        }
+      },
+      "title": "BrowserSettings",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "workspace": {
+      "description": "Folder exposed to the agent and the only place it can write. Usually given as the command-line argument. Must not be `/`, your home folder, or a parent of it.",
+      "format": "path",
+      "title": "Workspace",
+      "type": "string"
+    },
+    "state_dir": {
+      "anyOf": [
+        {
+          "format": "path",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Where logs, the audit store and the sandbox home live. Must be outside the workspace. Default: `$XDG_STATE_HOME/dev-link-mcp/<folder name>-<hash>`.",
+      "title": "State Dir"
+    },
+    "log_level": {
+      "default": "INFO",
+      "description": "Server log level. Lower case is accepted.",
+      "enum": [
+        "DEBUG",
+        "INFO",
+        "WARNING",
+        "ERROR"
+      ],
+      "title": "Log Level",
+      "type": "string"
+    },
+    "server": {
+      "$ref": "#/$defs/ServerConfig",
+      "description": "Network address and authentication."
+    },
+    "sandbox": {
+      "$ref": "#/$defs/SandboxConfig",
+      "description": "Isolation of agent commands."
+    },
+    "limits": {
+      "$ref": "#/$defs/LimitsConfig",
+      "description": "Timeouts, size limits and resource caps for tools."
+    },
+    "audit": {
+      "$ref": "#/$defs/AuditConfig",
+      "description": "What the audit log keeps."
+    },
+    "tools": {
+      "$ref": "#/$defs/ToolsConfig",
+      "description": "Which tool groups are registered."
+    },
+    "groups": {
+      "additionalProperties": {
+        "type": "object"
+      },
+      "description": "Settings of each tool group, keyed by group name. Each group checks its own keys at start; see Tool groups below.",
+      "title": "Groups",
+      "type": "object",
+      "default": {},
+      "properties": {
+        "system": {
+          "$ref": "#/$defs/NoSettings"
+        },
+        "files": {
+          "$ref": "#/$defs/NoSettings"
+        },
+        "search": {
+          "$ref": "#/$defs/NoSettings"
+        },
+        "shell": {
+          "$ref": "#/$defs/NoSettings"
+        },
+        "processes": {
+          "$ref": "#/$defs/NoSettings"
+        },
+        "code": {
+          "$ref": "#/$defs/NoSettings"
+        },
+        "project": {
+          "$ref": "#/$defs/ProjectSettings"
+        },
+        "http": {
+          "$ref": "#/$defs/HttpSettings"
+        },
+        "data": {
+          "$ref": "#/$defs/NoSettings"
+        },
+        "checkpoints": {
+          "$ref": "#/$defs/NoSettings"
+        },
+        "tasks": {
+          "$ref": "#/$defs/NoSettings"
+        },
+        "docker": {
+          "$ref": "#/$defs/DockerSettings"
+        },
+        "browser": {
+          "$ref": "#/$defs/BrowserSettings"
+        }
+      }
+    }
+  },
+  "title": "dev-link configuration file",
+  "type": "object"
+}

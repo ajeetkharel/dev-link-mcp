@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>dev-link · live</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="css/app.css">
+<script type="module" src="js/main.js"></script>
+</head>
+<body>
+<header class="top">
+  <div class="wrap">
+    <div class="brand">dev-link <small>agent monitor</small></div>
+    <div class="ws" id="ws" title="">loading workspace…</div>
+    <div class="chips" id="chips"></div>
+    <div class="live" id="live" data-state="down" role="status" aria-live="polite"><i></i><span>Connecting</span></div>
+  </div>
+</header>
+
+<main class="wrap">
+  <div class="banner" id="banner" role="alert" hidden></div>
+
+  <div class="overview">
+    <h2 id="range-label">Last 24 hours</h2>
+    <div class="seg" id="range" role="group" aria-label="Time range">
+      <button type="button" data-s="3600" aria-pressed="false">1h</button>
+      <button type="button" data-s="21600" aria-pressed="false">6h</button>
+      <button type="button" data-s="86400" aria-pressed="true">24h</button>
+      <button type="button" data-s="604800" aria-pressed="false">7d</button>
+    </div>
+  </div>
+
+  <section class="tiles" aria-label="Summary">
+    <div class="tile"><div class="k">Tool calls</div><div class="v" id="t-calls">–</div><div class="s" id="t-calls-s"></div></div>
+    <div class="tile" id="tile-err"><div class="k">Errors</div><div class="v" id="t-err">–</div><div class="s" id="t-err-s"></div></div>
+    <div class="tile"><div class="k">Avg duration</div><div class="v" id="t-avg">–</div><div class="s" id="t-avg-s"></div></div>
+    <div class="tile" id="tile-run"><div class="k">Running now</div><div class="v" id="t-run">–</div><div class="s" id="t-run-s"></div></div>
+    <div class="tile"><div class="k">Clients</div><div class="v" id="t-cli">–</div><div class="s" id="t-cli-s"></div></div>
+  </section>
+
+  <section class="grid2">
+    <div class="card">
+      <div class="card-h">
+        <h3>Calls over time</h3>
+        <div class="legend"><span><i class="ok"></i>Succeeded</span><span><i class="bad"></i>Failed</span></div>
+      </div>
+      <div class="chart" id="chart"><div class="tip" id="tip" hidden></div></div>
+    </div>
+    <div class="card">
+      <div class="card-h"><h3>Per tool</h3><span class="muted small">Click a row to filter the activity</span></div>
+      <div class="scroll tools-scroll">
+        <table id="pertool">
+          <thead><tr>
+            <th class="sortable" data-k="name">Tool</th>
+            <th class="sortable num" data-k="calls">Calls</th>
+            <th class="sortable num" data-k="errors">Errors</th>
+            <th class="sortable num" data-k="avg_ms">Avg</th>
+            <th class="sortable num" data-k="max_ms">Max</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <nav class="tabs" role="tablist" id="tabs">
+    <button type="button" role="tab" data-tab="activity" aria-selected="true">Activity</button>
+    <button type="button" role="tab" data-tab="processes" aria-selected="false">Processes<span class="count" id="proc-count">0</span></button>
+    <button type="button" role="tab" data-tab="tasks" aria-selected="false">Tasks &amp; notes<span class="count" id="task-count">0</span></button>
+    <button type="button" role="tab" data-tab="files" aria-selected="false">Files</button>
+    <button type="button" role="tab" data-tab="tools" aria-selected="false">Tools<span class="count" id="tool-count">0</span></button>
+  </nav>
+
+  <section class="panel card" id="p-activity" role="tabpanel">
+    <div class="bar">
+      <select id="f-kind" aria-label="Kind">
+        <option value="">All kinds</option><option value="tool">Tool calls</option><option value="session">Sessions</option>
+        <option value="process">Processes</option><option value="server">Server</option>
+      </select>
+      <select id="f-status" aria-label="Status">
+        <option value="">Any status</option><option value="ok">OK</option><option value="error">Error</option><option value="running">Running</option>
+      </select>
+      <select id="f-name" aria-label="Tool"><option value="">All tools</option></select>
+      <input type="search" id="f-q" placeholder="Search args, results, errors" aria-label="Search">
+      <span id="f-tags"></span>
+      <span class="grow"></span>
+      <button type="button" class="btn" id="pause">Pause live</button>
+    </div>
+    <div class="feed-wrap">
+      <div class="agrid ahead" aria-hidden="true">
+        <span>Time</span><span class="kindc">Kind</span><span>Name</span><span class="client">Client</span><span>Status</span><span class="num">Duration</span><span>Arguments</span>
+      </div>
+      <button type="button" class="newpill" id="newpill" hidden></button>
+      <div class="vl feed" id="feed" tabindex="0" role="grid" aria-label="Activity, newest first. Arrow keys move, Enter opens."></div>
+    </div>
+    <div class="foot"><span id="feed-count"></span><button type="button" class="btn" id="older">Load older</button></div>
+  </section>
+
+  <section class="panel" id="p-processes" role="tabpanel" hidden>
+    <div class="proc-grid">
+      <div class="card">
+        <div class="card-h"><h3>Background processes</h3><button type="button" class="btn small" id="proc-refresh">Refresh</button></div>
+        <div class="scroll">
+          <table><thead><tr><th>Id</th><th>Name</th><th>Status</th><th class="num">Uptime</th><th>Command</th><th></th></tr></thead>
+            <tbody id="procs"></tbody></table>
+        </div>
+        <div class="empty-state" id="procs-empty">No background processes. The agent starts them with start_process.</div>
+      </div>
+      <div class="card">
+        <div class="card-h">
+          <h3 id="log-title">Log</h3>
+          <label class="check"><input type="checkbox" id="log-follow" checked>Follow</label>
+        </div>
+        <div class="vl lines" id="log" tabindex="0" aria-label="Process log"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel" id="p-tasks" role="tabpanel" hidden>
+    <div class="tasks-grid">
+      <div class="card">
+        <div class="card-h"><h3>Tasks</h3><span class="muted small" id="task-summary"></span><button type="button" class="btn small" id="tasks-refresh">Refresh</button></div>
+        <div id="tasks"></div>
+      </div>
+      <div class="card">
+        <div class="card-h"><h3>Notes</h3></div>
+        <table><thead><tr><th>Key</th><th>Updated</th><th class="num">Size</th></tr></thead><tbody id="notes"></tbody></table>
+        <div class="empty-state" id="notes-empty">No notes.</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel" id="p-files" role="tabpanel" hidden>
+    <div class="files-grid">
+      <div class="card">
+        <div class="card-h"><h3>Workspace</h3><span class="muted small">read-only</span></div>
+        <div class="tree" id="tree" role="tree" aria-label="Workspace files"></div>
+      </div>
+      <div class="card preview">
+        <div class="card-h">
+          <nav class="crumbs" id="crumbs" aria-label="Path"></nav>
+          <span class="muted small" id="file-meta"></span>
+          <a class="btn small" id="file-download" hidden>Download</a>
+          <button type="button" class="btn small" id="files-refresh">Refresh</button>
+        </div>
+        <div id="file-view"><div class="empty-state">Select a file to preview it.</div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel" id="p-tools" role="tabpanel" hidden>
+    <div class="bar card">
+      <input type="search" id="tool-q" placeholder="Search tools by name or description" aria-label="Search tools">
+      <span class="muted small" id="tool-match"></span>
+    </div>
+    <div class="tools-grid">
+      <div class="card tool-list" id="tool-list"></div>
+      <div class="card tool-detail" id="tool-detail"><div class="empty-state">Select a tool.</div></div>
+    </div>
+  </section>
+</main>
+
+<div class="scrim" id="scrim" hidden></div>
+<aside class="drawer" id="drawer" hidden aria-label="Event detail" role="dialog">
+  <div class="drawer-h">
+    <h3 id="d-title"></h3>
+    <span id="d-pill"></span>
+    <button type="button" class="btn small" id="d-close" aria-label="Close">Close</button>
+  </div>
+  <div class="drawer-b" id="d-body"></div>
+</aside>
+<dialog class="lightbox" id="lightbox" aria-label="Image">
+  <figure>
+    <img id="lb-img" alt="">
+    <figcaption><span id="lb-cap"></span><a class="btn small" id="lb-open" target="_blank" rel="noopener">Open</a><button type="button" class="btn small" id="lb-close">Close</button></figcaption>
+  </figure>
+</dialog>
+</body>
+</html>

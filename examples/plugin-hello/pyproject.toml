@@ -1,0 +1,15 @@
+[project]
+name = "dev-link-hello"
+version = "0.1.0"
+description = "Example dev-link tool group plugin with one hello tool"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["dev-link-mcp"]
+
+# The entry point name is the group name used in `tools.enabled` and `groups.<name>`.
+[project.entry-points."dev_link_mcp.tool_groups"]
+hello = "dev_link_hello:HelloGroup"
+
+[build-system]
+requires = ["uv_build>=0.11.26,<0.12.0"]
+build-backend = "uv_build"

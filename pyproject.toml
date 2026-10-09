@@ -1,0 +1,95 @@
+[project]
+name = "dev-link-mcp"
+version = "0.1.0"
+description = "Sandboxed, fully logged development MCP server that exposes one folder to a coding agent"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Amit Kharel" }]
+keywords = ["mcp", "model-context-protocol", "coding-agent", "sandbox", "bubblewrap", "developer-tools"]
+# PEP 639: with an SPDX `license` expression, a License :: classifier is not allowed.
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development",
+    "Typing :: Typed",
+]
+dependencies = [
+    "httpx>=0.28.1",
+    "mcp>=2.3.0",
+    "pydantic>=2.13.5",
+    "pyyaml>=6.0.3",
+    "starlette>=1.7.0",
+    "uvicorn>=0.54.0",
+]
+
+# Tool groups with heavy dependencies; without them the group is reported as not installed.
+[project.optional-dependencies]
+browser = ["playwright>=1.63.0"]
+code = ["tree-sitter-language-pack>=1.21.0"]
+all = ["dev-link-mcp[browser,code]"]
+
+[project.urls]
+Homepage = "https://github.com/ajeetkharel/dev-link-mcp"
+Repository = "https://github.com/ajeetkharel/dev-link-mcp"
+Issues = "https://github.com/ajeetkharel/dev-link-mcp/issues"
+Changelog = "https://github.com/ajeetkharel/dev-link-mcp/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/ajeetkharel/dev-link-mcp/tree/main/docs"
+
+[project.scripts]
+dev-link = "dev_link_mcp.cli:main"
+# Same CLI under the package name, so `uvx dev-link-mcp ...` works (MCP registry clients run that).
+dev-link-mcp = "dev_link_mcp.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.26,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    # Development and tests cover every tool group.
+    "dev-link-mcp[all]",
+    "mypy>=2.4.0",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.10",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+addopts = ["--strict-markers"]
+# Host requirements; tests/conftest.py skips a marked test when this host lacks one.
+markers = [
+    "bwrap: needs a working bubblewrap sandbox (bwrap installed and able to create namespaces)",
+    "browser: needs the browser extra installed and a Chromium that launches",
+    "docker: needs the docker CLI, a reachable daemon and the busybox:latest image",
+    "network: needs outbound internet access",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "ASYNC", "S", "SIM", "RUF"]
+ignore = ["S101", "S603", "S607", "S108", "RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "ASYNC"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+check_untyped_defs = true

@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - run: uv lock --check
+      # The dev group pulls in every extra, which gen_docs.py needs for docs/tools.md.
+      - run: uv sync --locked --all-extras
+      - run: uv run --frozen ruff check .
+      - run: uv run --frozen ruff format --check .
+      - run: uv run --frozen mypy src
+      - run: uv run --frozen python scripts/gen_docs.py --check
+
+  test-linux:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install bubblewrap and ripgrep
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap ripgrep
+      # Ubuntu 24.04 lets AppArmor block the unprivileged user namespaces bwrap needs.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - run: uv sync --locked --all-extras
+      - run: uv run --frozen dev-link doctor
+      - run: uv run --frozen pytest -rfs
+
+  browser:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install bubblewrap and ripgrep
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap ripgrep
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - run: uv sync --locked --all-extras
+      - run: uv run --frozen dev-link install-browser
+      # install-browser fetches Chromium only; the runner also needs its system libraries.
+      - run: uv run --frozen playwright install-deps chromium
+      - run: uv run --frozen pytest -m browser -rfs
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: brew install ripgrep
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - run: uv sync --locked --all-extras
+      # No bubblewrap here: bwrap tests skip and the rest run on the `none` backend.
+      - run: uv run --frozen pytest -rfs
+
+  lowest-direct:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install bubblewrap and ripgrep
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap ripgrep
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: "3.11"
+          enable-cache: true
+      # Checks the lower bounds in pyproject.toml; this re-resolves instead of using uv.lock.
+      - run: uv sync --resolution lowest-direct --all-extras
+      - run: uv run --no-sync pytest -rfs
+
+  plugin-example:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv pip install ./examples/plugin-hello
+      - name: The plugin registers only when enabled
+        run: |
+          set -euo pipefail
+          off="$(uv run --no-sync dev-link tools)"
+          if grep -q hello <<<"$off"; then
+            echo "hello is listed without --enable hello"; exit 1
+          fi
+          on="$(uv run --no-sync dev-link tools --enable hello --group hello)"
+          echo "$on"
+          grep -q '^hello (1)$' <<<"$on"

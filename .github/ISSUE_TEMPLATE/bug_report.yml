@@ -1,0 +1,76 @@
+name: Bug report
+description: Something in dev-link does not work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security problems, such as a sandbox escape or a way past the token, go through
+        [private reporting](https://github.com/ajeetkharel/dev-link-mcp/security/advisories/new), not here.
+        Remove tokens and private paths from anything you paste.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: Include error messages and the tool call that failed, if any.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. dev-link start ~/project
+        2. Ask the agent to ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: dev-link version
+      description: Output of `dev-link --version`.
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: dev-link doctor output
+      description: Output of `dev-link doctor DIR` for the folder you served.
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS and distribution
+      placeholder: Ubuntu 24.04, Fedora 42, macOS 15 ...
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: MCP client and version
+      placeholder: Claude Code 2.x, Cursor ...
+    validations:
+      required: true
+  - type: dropdown
+    id: sandbox
+    attributes:
+      label: Sandbox
+      options:
+        - "On (bubblewrap)"
+        - "Off (--no-sandbox)"
+    validations:
+      required: true

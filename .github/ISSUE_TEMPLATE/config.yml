@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/ajeetkharel/dev-link-mcp/security/advisories/new
+    about: Report sandbox escapes, auth bypasses and other vulnerabilities privately, not in a public issue.
