@@ -360,3 +360,23 @@ async def test_wait_for_process_timeout_names_the_target(connect):
         r = await client.call_tool("start_process", {"command": "sleep 30", "wait_for_port": 1, "wait_timeout_s": 0.3})
     assert not r.is_error
     assert "waiting for port 1; the process is still running" in text(r)
+
+
+async def test_wait_for_process_port_held_by_another_program_is_not_success_after_exit(connect):
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        async with connect("processes") as client:
+            await client.call_tool("start_process", {"command": "echo bind failed; exit 1"})
+            r = await client.call_tool("wait_for_process", {"id": "p1", "port": port, "timeout_s": 5})
+            started = await client.call_tool(
+                "start_process", {"command": "echo bind failed; exit 1", "wait_for_port": port, "wait_timeout_s": 5}
+            )
+    assert r.is_error
+    assert "accepting connections" not in text(r)
+    assert "exited with code 1" in text(r)
+    assert "bind failed" in text(r)
+    assert "accepting connections" not in text(started)
+    assert "exited with code 1" in text(started)
+    assert "status=exited(1)" in text(started)

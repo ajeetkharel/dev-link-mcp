@@ -22,6 +22,10 @@ from dev_link_mcp.sandbox import Sandbox, kill_group_rest, kill_tree
 LOG_DIR = "processes"
 
 
+class ProcessExited(ToolError):
+    """A process exited nonzero while a caller was waiting for its output or port."""
+
+
 @dataclass
 class ManagedProcess:
     id: str
@@ -233,7 +237,8 @@ class ProcessManager:
     ) -> str:
         """Block until the log matches `pattern`, `port` accepts TCP connections, or the process exits.
 
-        Returns a short description of what happened. Raises ToolError on timeout.
+        Returns a short description of what happened. Raises ToolError on timeout, and
+        ProcessExited when the process exits nonzero on its own while a pattern or port was awaited.
         """
         managed = self.get(process_id)
         try:
@@ -241,6 +246,7 @@ class ProcessManager:
         except re.error as exc:
             raise ToolError(f"invalid pattern {pattern!r}: {exc}") from exc
         deadline = time.monotonic() + timeout_s
+        port_seen = False
         while time.monotonic() < deadline:
             if regex:
                 text, _ = self.read_log(process_id, tail_lines=500, max_bytes=500_000)
@@ -248,9 +254,18 @@ class ProcessManager:
                 match = await asyncio.to_thread(regex.search, text)
                 if match:
                     return f"log matched {pattern!r}: {match.group(0)[:200]}"
-            if port and _port_open(port):
-                return f"port {port} is accepting connections"
+            # An exited process cannot own the port; whatever answers there is another program.
+            # A process that is about to fail may still be alive on the first sighting, so the
+            # port must be open on two polls in a row with the process running both times.
+            if port and managed.running and _port_open(port):
+                if port_seen:
+                    return f"port {port} is accepting connections"
+                port_seen = True
+            else:
+                port_seen = False
             if not managed.running:
+                if managed.exit_code and not managed.stopping and (regex or port):
+                    raise ProcessExited(f"process exited with code {managed.exit_code}")
                 return f"process exited with code {managed.exit_code}"
             await asyncio.sleep(0.25)
         targets = [f"{pattern!r}"] if pattern else []

@@ -12,6 +12,7 @@ from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
 
+from dev_link_mcp.processes import ProcessExited
 from dev_link_mcp.runtime import Runtime
 from dev_link_mcp.tools.base import ToolGroup
 from dev_link_mcp.tools.common import DESTRUCTIVE, OPEN_WORLD, READ_ONLY, clip
@@ -109,6 +110,9 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
         rt.processes.get(process_id)  # an unknown id must surface as such, not as a timeout
         try:
             return await rt.processes.wait_for(process_id, pattern=pattern, port=port, timeout_s=timeout_s)
+        except ProcessExited as exc:
+            tail, _ = rt.processes.read_log(process_id, tail_lines=20)
+            raise ToolError(f"{exc}; last output:\n{tail or '(no output)'}") from None
         except ToolError:
             raise ToolError(
                 f"timed out after {timeout_s:g}s waiting for {_wait_target(pattern, port)};"

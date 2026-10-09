@@ -49,7 +49,7 @@ function renderTiles() {
   const slowest = tools.reduce((m, t) => (t.max_ms > (m ? m.max_ms : -1) ? t : m), null);
   $("t-avg-s").textContent = slowest ? "slowest " + slowest.name + " " + fmtMs(slowest.max_ms) : "";
   $("t-run").textContent = fmtInt(st.running);
-  $("t-run-s").textContent = st.running ? "calls in flight" : "idle";
+  $("t-run-s").textContent = st.running ? "tool calls running" : "idle";
   $("tile-run").classList.toggle("has-run", st.running > 0);
   $("t-cli").textContent = fmtInt(st.clients);
   $("t-cli-s").textContent = "by session, else client name";
