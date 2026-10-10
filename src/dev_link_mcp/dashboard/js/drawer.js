@@ -168,7 +168,8 @@ export function close() {
   seq++;
   $("drawer").hidden = true;
   $("scrim").hidden = true;
-  if (returnFocus && document.contains(returnFocus)) returnFocus.focus();
+  // The feed can run past the bottom of the window; a plain focus() would scroll the page to it.
+  if (returnFocus && document.contains(returnFocus)) returnFocus.focus({ preventScroll: true });
   returnFocus = null;
 }
 
