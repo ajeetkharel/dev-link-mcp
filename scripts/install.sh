@@ -57,11 +57,19 @@ main() {
     fi
 
     say "checking the setup"
-    dev-link doctor || true
+    # doctor refuses the home directory as a workspace and then skips the sandbox checks, so
+    # check against an empty folder, with a state dir that is removed again.
+    probe="$(mktemp -d)"
+    probe_state="$(mktemp -d)"
+    dev-link doctor "$probe" --state-dir "$probe_state" || true
+    rm -rf "$probe" "$probe_state"
 
     case ":$PATH_BEFORE:" in
         *":$bin:"*) ;;
-        *) warn "$bin is not on your PATH; open a new terminal, or run: export PATH=\"$bin:\$PATH\"" ;;
+        *)
+            uv tool update-shell >/dev/null 2>&1 || true
+            warn "$bin is not on your PATH yet; open a new terminal, or run: export PATH=\"$bin:\$PATH\""
+            ;;
     esac
     printf '\nDone. Start a server in your project folder:\n\n  cd your-project && dev-link start . --tunnel\n\n'
     printf 'Drop --tunnel for a client on this machine (Claude Code, Codex, Cursor, VS Code).\n'
