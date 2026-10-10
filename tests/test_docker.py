@@ -724,6 +724,39 @@ async def test_compose_env_file_outside_workspace_is_refused(connect, workspace,
 
 
 @pytest.mark.docker
+async def test_compose_label_file_outside_workspace_is_refused(connect, workspace, outside):
+    # Compose v2 drops the label_file path from its render and inlines the labels, so only the
+    # uninterpolated render shows the path.
+    (outside / "labels").write_text("SECRET=toplabel\n")
+    (workspace / "compose.yaml").write_text(
+        f"services:\n  a:\n    image: {IMAGE}\n    label_file: [{outside}/labels]\n"
+    )
+    async with connect("docker") as client:
+        result = await client.call_tool("compose", {"action": "up"})
+    assert result.is_error
+    assert "label_file" in text(result) and "outside the workspace" in text(result)
+    assert "toplabel" not in text(result)
+
+
+def test_file_reference_violations(workspace):
+    root = workspace.resolve()
+    config = {
+        "services": {
+            "a": {
+                "env_file": [{"path": "/etc/environment"}, {"path": str(root / ".env")}],
+                "label_file": ["/etc/os-release", str(root / "labels")],
+            },
+            "b": {"env_file": [{"path": f"{root}/${{ENV_FILE}}"}]},
+        }
+    }
+    assert docker_mod.file_reference_violations(config, root) == [
+        "service 'a': env_file '/etc/environment' is outside the workspace",
+        "service 'a': label_file '/etc/os-release' is outside the workspace",
+        f"service 'b': env_file '{root}/${{ENV_FILE}}' uses a variable; write the path out",
+    ]
+
+
+@pytest.mark.docker
 async def test_compose_cannot_take_over_foreign_project(connect, workspace, outside):
     project = f"dev-link-foreign-{secrets.token_hex(3)}"
     (outside / "compose.yaml").write_text(

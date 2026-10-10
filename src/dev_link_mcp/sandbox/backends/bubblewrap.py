@@ -34,11 +34,24 @@ def _probe(bwrap: str) -> str | None:
     """Run one throwaway sandbox. None when it works, else the first line bwrap printed.
 
     `bwrap` existing is not enough: AppArmor, a container or a sysctl can forbid the
-    namespaces it creates. Cached because the answer does not change while the server runs.
+    namespaces it creates, and a container can forbid mounting /proc, which every command
+    needs. Cached because the answer does not change while the server runs.
     """
     try:
         done = subprocess.run(
-            [bwrap, "--unshare-all", "--die-with-parent", "--ro-bind", "/", "/", "true"],
+            [
+                bwrap,
+                "--unshare-all",
+                "--die-with-parent",
+                "--ro-bind",
+                "/",
+                "/",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+                "true",
+            ],
             capture_output=True,
             text=True,
             timeout=5,

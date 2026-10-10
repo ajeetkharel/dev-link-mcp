@@ -322,6 +322,26 @@ def compose_violations(config: dict[str, Any], root: Path) -> list[str]:
     return problems
 
 
+def file_reference_violations(config: dict[str, Any], root: Path) -> list[str]:
+    """env_file and label_file entries in an uninterpolated compose config (`docker compose config
+    --no-env-resolution --no-interpolate --format json`) that name a file outside `root`.
+
+    Compose reads these files into a container's environment and labels, where the agent can read
+    them back. Compose v2 inlines their contents into the interpolated render and drops the paths,
+    even with --no-env-resolution, so the paths only show up without interpolation. A path that
+    still holds a variable is refused, because compose fills it in only when it runs."""
+    problems: list[str] = []
+    for name, svc in (config.get("services") or {}).items():
+        for key in ("env_file", "label_file"):
+            for item in svc.get(key) or []:
+                file = str(item.get("path", "") if isinstance(item, dict) else item)
+                if "$" in file:
+                    problems.append(f"service {name!r}: {key} {file!r} uses a variable; write the path out")
+                elif not Path(file).is_absolute() or not Path(file).resolve().is_relative_to(root):
+                    problems.append(f"service {name!r}: {key} {file!r} is outside the workspace")
+    return problems
+
+
 def _build_violations(where: str, build: dict[str, Any], outside: Callable[[str], bool]) -> list[str]:
     problems: list[str] = []
     for key in build:
@@ -940,6 +960,15 @@ def _register(mcp: MCPServer, rt: Runtime, settings: DockerSettings, started: _S
             raise fail("compose config", checked)
         config = json.loads(checked.stdout)
         problems = compose_violations(config, root)
+        unresolved = await docker(
+            [*base, "config", "--no-env-resolution", "--no-interpolate", "--format", "json"],
+            cwd=path.parent,
+            stdin=content,
+        )
+        if not unresolved.ok:
+            raise fail("compose config", unresolved)
+        # Both renders can report the same env_file; each problem is listed once.
+        problems = list(dict.fromkeys(problems + file_reference_violations(json.loads(unresolved.stdout), root)))
         if problems:
             raise ToolError("compose file refused:\n- " + "\n- ".join(problems))
         project = str(config.get("name") or "")

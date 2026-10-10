@@ -17,8 +17,10 @@ from typing import BinaryIO
 from mcp.server.mcpserver.exceptions import ToolError
 
 # Each directory below the root is opened with O_NOFOLLOW, so a symlink fails the open instead of
-# being followed. O_PATH needs no read permission and is enough to act as a dir_fd.
-_WALK_FLAGS = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+# being followed. O_PATH needs no read permission and is enough to act as a dir_fd; it is
+# Linux-only, so macOS opens the directory for reading instead.
+_DIR_ONLY = getattr(os, "O_PATH", os.O_RDONLY)
+_WALK_FLAGS = _DIR_ONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _SWAPPED = (errno.ENOTDIR, errno.ELOOP)
 
 
@@ -48,11 +50,11 @@ def _open_dir(directory: Path, beneath: Path | None, create: bool) -> int:
     if beneath is None:
         if create:
             directory.mkdir(parents=True, exist_ok=True)
-        return os.open(directory, os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+        return os.open(directory, _DIR_ONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     if not directory.is_relative_to(beneath):
         raise ToolError(f"path is outside the workspace: {directory}")
     parts = directory.relative_to(beneath).parts
-    fd = os.open(beneath, os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+    fd = os.open(beneath, _DIR_ONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
         for depth, name in enumerate(parts, 1):
             here = beneath.joinpath(*parts[:depth])
@@ -81,7 +83,7 @@ def _open_dir(directory: Path, beneath: Path | None, create: bool) -> int:
 
 @contextlib.contextmanager
 def dir_fd(directory: Path, beneath: Path | None, *, create: bool = False) -> Iterator[int]:
-    """O_PATH descriptor of `directory`, held open for the `with` block, for use as a dir_fd.
+    """Directory descriptor (O_PATH on Linux) of `directory`, held open for the `with` block, for use as a dir_fd.
 
     With `beneath` (a resolved root), the walk starts at the root and refuses every symlink
     below it, so a directory swapped for a symlink after the path was checked cannot redirect
