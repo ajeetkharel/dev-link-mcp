@@ -44,7 +44,7 @@ main() {
 
     say "installing Chromium for the browser tools"
     dev-link install-browser
-    if [ "$os" = Linux ] && have apt-get; then
+    if [ "$os" = Linux ] && have apt-get && ! chromium_launches; then
         # Chromium needs system libraries that Playwright knows how to install on Debian and Ubuntu.
         # Run as you, not root: the tool's Python is user-writable, and Playwright itself puts only
         # its apt-get commands under sudo.
@@ -122,6 +122,16 @@ install_macos_packages() {
     say "installing git, ripgrep and cloudflared"
     brew install git ripgrep cloudflared
     warn "macOS has no bubblewrap: start dev-link with --no-sandbox, which gives the agent your full user access"
+}
+
+# Chromium only starts once its system libraries are there, so a clean launch means a rerun can
+# skip install-deps and its sudo prompt.
+chromium_launches() {
+    "$(uv tool dir)/dev-link-mcp/bin/python" -c '
+from playwright.sync_api import sync_playwright
+with sync_playwright() as p:
+    p.chromium.launch().close()
+' >/dev/null 2>&1
 }
 
 as_root() {
