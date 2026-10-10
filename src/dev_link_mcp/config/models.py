@@ -263,6 +263,14 @@ class Config(Section):
         if self.state_dir.is_relative_to(self.workspace):
             raise ValueError("state_dir must be outside the workspace so the agent cannot edit its own logs")
         self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # mkdir's mode only applies to a new directory; one that already exists, such as a
+        # --state-dir picked by hand, may be open to other users and holds the audit log.
+        if self.state_dir.stat().st_mode & 0o077:
+            try:
+                self.state_dir.chmod(0o700)
+            except OSError as e:
+                message = f"state_dir {self.state_dir} is open to other users and cannot be made private: {e}"
+                raise ValueError(message) from e
         return self
 
     @property

@@ -33,7 +33,7 @@ main() {
 
     if ! have uv; then
         say "installing uv"
-        curl -LsSf https://astral.sh/uv/install.sh | sh
+        curl --proto '=https' --tlsv1.2 -LsSf https://astral.sh/uv/install.sh | sh
     fi
     export PATH="$bin:$PATH"
 
@@ -46,7 +46,9 @@ main() {
     dev-link install-browser
     if [ "$os" = Linux ] && have apt-get; then
         # Chromium needs system libraries that Playwright knows how to install on Debian and Ubuntu.
-        as_root "$(uv tool dir)/dev-link-mcp/bin/python" -m playwright install-deps chromium ||
+        # Run as you, not root: the tool's Python is user-writable, and Playwright itself puts only
+        # its apt-get commands under sudo.
+        "$(uv tool dir)/dev-link-mcp/bin/python" -m playwright install-deps chromium ||
             warn "could not install Chromium's system libraries; the browser tools may not start"
     fi
 
@@ -110,7 +112,7 @@ install_cloudflared_linux() {
     esac
     say "installing cloudflared to $bin"
     mkdir -p "$bin"
-    curl -fsSL -o "$bin/cloudflared" \
+    curl --proto '=https' --tlsv1.2 -fsSL -o "$bin/cloudflared" \
         "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$arch"
     chmod +x "$bin/cloudflared"
 }

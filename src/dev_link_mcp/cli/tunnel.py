@@ -22,9 +22,10 @@ if TYPE_CHECKING:
 # cloudflared also logs its API host (api.trycloudflare.com) when a tunnel request fails.
 _URL = re.compile(r"https://(?!api\.)[A-Za-z0-9-]+\.trycloudflare\.com")
 
+INSTALL_DOCS = "https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/clients/web.md#install-cloudflared"
 INSTALL_HINT = (
-    "cloudflared is not installed; install it (e.g. `brew install cloudflared`, or the package from Cloudflare's"
-    " cloudflared downloads page) or start without --tunnel"
+    f"cloudflared is not installed; install it (Linux: {INSTALL_DOCS}, macOS: brew install cloudflared)"
+    " or start without --tunnel"
 )
 
 

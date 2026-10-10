@@ -16,6 +16,7 @@ from typing import Literal, NamedTuple
 
 from dev_link_mcp.cli import instance
 from dev_link_mcp.cli.common import config_from_args
+from dev_link_mcp.cli.tunnel import INSTALL_DOCS
 from dev_link_mcp.config import Config
 from dev_link_mcp.sandbox.backends.bubblewrap import Bubblewrap
 from dev_link_mcp.sandbox.limits import ResourceLimits
@@ -46,7 +47,7 @@ def _programs(tunnel: bool) -> list[Check]:
     for name, fix, needed in (
         ("git", "install git; checkpoints and apply_patch need it", False),
         ("rg", "install ripgrep (e.g. apt install ripgrep or brew install ripgrep); the search tools need it", False),
-        ("cloudflared", "install cloudflared (e.g. brew install cloudflared); only --tunnel needs it", tunnel),
+        ("cloudflared", f"install cloudflared (see {INSTALL_DOCS}); only --tunnel needs it", tunnel),
     ):
         path = shutil.which(name)
         if path:

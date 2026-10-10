@@ -223,6 +223,9 @@ def test_start_status_url_logs_stop(tmp_path, cli_env):
     other = run(cli_env, "start", str(ws_b), "--token", token, *sandbox_flags())
     try:
         assert other.returncode == 0, other.stderr
+        # Captured output is not a terminal, so the token stays out of it.
+        assert token not in other.stdout
+        assert "/mcp/***" in other.stdout and f"dev-link url {ws_b}" in other.stdout
         again = run(cli_env, "start", str(ws_a), *sandbox_flags())
         assert again.returncode == 1
         assert again.stderr.startswith(f"dev-link: already running for {ws_a}, PID ")

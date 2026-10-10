@@ -21,6 +21,12 @@ dev-link.yaml
 .env
 .env.*
 
+# Agent and MCP client files from using this repo with a coding agent
+.claude/
+.mcp.json
+*.log
+*.sqlite3
+
 # Editors and OS
 .vscode/
 .idea/

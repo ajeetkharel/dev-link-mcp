@@ -19,7 +19,7 @@ URL works from anywhere on the internet. Treat both like a password.
 - The token is written only to `connection.json` (0600 in the state dir), which `dev-link url`
   reads. Everywhere else it is replaced with `***` before it is written: the audit log,
   background process logs, `server.log`, `tunnel.log` and every server log line. The startup
-  banner shows the token only when its output is a terminal. Request logging is off. A
+  banner and the output of `dev-link start` show the token only when their output is a terminal. Request logging is off. A
   background process that stops for more than 0.2 s in the middle of printing the token leaves
   the part before the pause in its log.
 - The server speaks plain HTTP. On the default `127.0.0.1` that stays on your machine. If you

@@ -9,37 +9,6 @@ format may change between minor releases; every such change is listed here.
 
 ## [Unreleased]
 
-### Changed
-
-- With the network off, `http_request`, `fetch_url`, `download_file` and the browser no longer
-  reach the host's loopback. The HTTP tools refuse every request, the browser tools open only
-  `about:blank`, and pages load only `data:`, `blob:` and `about:` resources, with WebRTC turned
-  off. `start_process` and `wait_for_process` refuse to wait for a port.
-- With the network off, the docker group no longer gives containers network access. Containers
-  run with `--network none`, compose services share internal networks isolated from the host
-  (Docker 28 or newer), and published ports, image pulls and image builds are refused.
-- compose refuses volumes whose `driver_opts` type is anything but `none`, `bind` or `tmpfs`, so
-  the daemon cannot mount network shares for the agent.
-- The startup banner shows the token only when its output is a terminal. uvicorn's log lines
-  now use the server's log format.
-
-### Fixed
-
-- The server token no longer reaches background process logs, `server.log`, `tunnel.log` or
-  server log lines on disk; it is replaced with `***` before it is written.
-- The server refuses to start, and `dev-link doctor` fails, when the sandbox would mount the state
-  dir, which holds the audit log and the token, or when a `ro_paths` or `rw_paths` entry lies
-  inside a folder the agent can write.
-- Old audit events and process logs are also pruned once a day while the server runs, not only
-  at startup. Logs of processes the server still lists are kept.
-- A configured token is dropped with `auth: none`, instead of being masked in logs.
-
-- SIGKILL or a crash of the server no longer leaves cloudflared or `--no-sandbox` commands
-  running. A small guard process kills them when the server is gone.
-- A `--tunnel` server now notices when cloudflared exits. It shuts down with exit status 1 and
-  shows the end of `tunnel.log`, instead of running on with a dead public URL.
-- `mcp` is pinned below 3: the tool schema trim relies on SDK internals.
-
 ## [0.1.0]
 
 First public release.
@@ -59,11 +28,32 @@ First public release.
   publishes it through a Cloudflare quick tunnel. The same CLI is also installed as `dev-link-mcp`,
   so `uvx dev-link-mcp` works.
 - A live dashboard of tool calls, processes, tasks and workspace files, and an audit log of every
-  call in SQLite and JSONL outside the workspace, pruned after `audit.retention_days`.
+  call in SQLite and JSONL outside the workspace, pruned after `audit.retention_days` at startup
+  and once a day.
 - Layered config: defaults, `~/.config/dev-link/config.yaml`, `--config FILE`, `DEV_LINK_*`
   variables and flags, with per-group settings under `groups.<name>`.
 - Tool group plugins through the `dev_link_mcp.tool_groups` entry point, loaded only when
   `tools.enabled` names them. The plugin API and config format are provisional.
+- `mcp` is pinned below 3, because the tool schema trim relies on SDK internals.
+
+### Security
+
+- With the network off, the HTTP tools refuse every request, the browser tools open only
+  `about:blank`, pages load only `data:`, `blob:` and `about:` resources and WebRTC is off, and
+  the process tools refuse to wait for a port. None of them can reach the host's loopback.
+- With the network off, containers run with `--network none`, compose services share internal
+  networks isolated from the host (Docker 28 or newer), and published ports, image pulls and
+  image builds are refused. compose refuses volumes whose `driver_opts` type is anything but
+  `none`, `bind` or `tmpfs`, so the daemon cannot mount network shares for the agent.
+- The token is replaced with `***` in the audit log, background process logs, `server.log`,
+  `tunnel.log` and server log lines. The startup banner and `dev-link start` show it only when
+  their output is a terminal. A configured token is dropped with `auth: none`.
+- The state dir, which holds the audit log, is made private (0700) even when it already exists.
+  The server refuses to start, and `dev-link doctor` fails, when the sandbox would mount the state
+  dir or when a `ro_paths` or `rw_paths` entry lies inside a folder the agent can write.
+- If the server is killed or crashes, a small guard process kills cloudflared and `--no-sandbox`
+  commands. A `--tunnel` server shuts down with exit status 1 when cloudflared exits, instead of
+  running on with a dead public URL.
 
 [Unreleased]: https://github.com/ajeetkharel/dev-link-mcp/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/ajeetkharel/dev-link-mcp/releases/tag/v0.1.0

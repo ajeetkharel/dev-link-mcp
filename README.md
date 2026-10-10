@@ -13,7 +13,7 @@
 <p align="center">
   <a href="https://pypi.org/project/dev-link-mcp/"><img src="https://img.shields.io/pypi/v/dev-link-mcp" alt="PyPI version"></a>
   <a href="https://pypi.org/project/dev-link-mcp/"><img src="https://img.shields.io/pypi/pyversions/dev-link-mcp" alt="Python versions"></a>
-  <a href="https://github.com/ajeetkharel/dev-link-mcp/blob/main/LICENSE"><img src="https://img.shields.io/pypi/l/dev-link-mcp" alt="License"></a>
+  <a href="https://github.com/ajeetkharel/dev-link-mcp/blob/main/LICENSE"><img src="https://img.shields.io/github/license/ajeetkharel/dev-link-mcp" alt="License"></a>
   <a href="https://github.com/ajeetkharel/dev-link-mcp/actions/workflows/ci.yml"><img src="https://github.com/ajeetkharel/dev-link-mcp/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
 </p>
 

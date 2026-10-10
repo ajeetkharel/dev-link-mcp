@@ -15,6 +15,7 @@ import urllib.request
 from types import FrameType
 from urllib.parse import urlsplit
 
+from dev_link_mcp.audit import redact
 from dev_link_mcp.cli import instance
 from dev_link_mcp.cli.common import CliError, resolve, where_args
 from dev_link_mcp.cli.tunnel import Tunnel
@@ -213,9 +214,26 @@ def cmd_start(args: argparse.Namespace) -> int:
     ]
     if "public_mcp_url" in info:
         lines.append("The public URL is reachable from the internet: anyone with it can run commands here.")
+    tokens = _tokens(info)
+    # Output that is not a terminal tends to end up in CI logs, journals or nohup.out, where a
+    # token, and with --tunnel the public URL, would give anyone who reads it the server.
+    hide = bool(tokens) and not sys.stdout.isatty()
+    if hide:
+        lines.append(f"The token is hidden because this output is not a terminal; dev-link url {where} prints the URL.")
     lines += ["", "Commands:", *(f"  dev-link {cmd} {where}" for cmd in ("status", "url", "logs server", "stop"))]
-    print("\n".join(lines))
+    text = "\n".join(lines)
+    print(redact(text, tokens) if hide else text)
     return 0
+
+
+def _tokens(info: dict) -> list[str]:
+    """The token in a connection.json `info`: in the MCP URL path with path-token auth, in the
+    Authorization header with bearer; empty with auth none."""
+    found = [value.removeprefix("Bearer ") for value in (info.get("headers") or {}).values()]
+    path = urlsplit(info.get("mcp_url", "")).path
+    if path.startswith("/mcp/"):
+        found.append(path.removeprefix("/mcp/"))
+    return [token for token in found if token]
 
 
 def _stop(config: Config) -> None:

@@ -71,6 +71,14 @@ def test_refuses_root_home_and_home_ancestors(tmp_path, monkeypatch):
     assert Config(workspace=project, state_dir=tmp_path / "state").finalize().workspace == project
 
 
+def test_existing_state_dir_is_made_private(tmp_path, workspace):
+    state = tmp_path / "shared"
+    state.mkdir(mode=0o755)
+    state.chmod(0o755)
+    Config(workspace=workspace, state_dir=state).finalize()
+    assert state.stat().st_mode & 0o777 == 0o700
+
+
 def test_state_dir_inside_workspace_rejected(workspace):
     with pytest.raises(ValueError, match="outside the workspace"):
         Config(workspace=workspace, state_dir=workspace / ".state").finalize()
