@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import stat
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -197,25 +198,35 @@ def _delete_files(rt: Runtime, rel_paths: list[str]) -> list[str]:
     """Remove files git reported as added since a checkpoint, then any directories left empty.
 
     The parent dir is resolved through Workspace, not the file itself, so a tracked symlink
-    is unlinked rather than followed.
+    is unlinked rather than followed. Unlinks go through a descriptor of the parent, so a
+    directory swapped for a symlink meanwhile raises ToolError instead of deleting host files.
     """
-    root = rt.workspace.root
+    ws = rt.workspace
+    root = ws.root
     deleted = []
     for rel in rel_paths:
         target = Path(rel)
-        parent = rt.workspace.resolve(str(target.parent) if str(target.parent) else ".")
-        path = parent / target.name
-        if path.is_symlink() or path.is_file():
-            path.unlink()
-            deleted.append(rel)
-            # Walk upwards removing directories this deletion emptied.
-            current = parent
-            while current != root and current.is_relative_to(root):
-                try:
-                    current.rmdir()
-                except OSError:
-                    break
-                current = current.parent
+        parent = ws.resolve(str(target.parent) if str(target.parent) else ".")
+        if not parent.is_dir():
+            continue
+        with ws.dir_fd(parent) as parent_fd:
+            try:
+                mode = os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False).st_mode
+            except FileNotFoundError:
+                continue
+            if not (stat.S_ISLNK(mode) or stat.S_ISREG(mode)):
+                continue
+            os.unlink(target.name, dir_fd=parent_fd)
+        deleted.append(rel)
+        # Walk upwards removing directories this deletion emptied.
+        current = parent
+        while current != root and current.is_relative_to(root):
+            try:
+                with ws.dir_fd(current.parent) as up:
+                    os.rmdir(current.name, dir_fd=up)
+            except (OSError, ToolError):
+                break
+            current = current.parent
     return deleted
 
 

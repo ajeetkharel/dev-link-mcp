@@ -483,3 +483,26 @@ async def test_tools_are_registered_with_annotations(connect):
     assert tools["grep"].annotations.read_only_hint is True
     assert tools["find_files"].annotations.read_only_hint is True
     assert tools["replace_in_files"].annotations.read_only_hint is False
+
+
+async def test_replace_runaway_pattern_is_stopped_at_the_timeout(connect, workspace, rt):
+    # Catastrophic backtracking would run for hours; the regex worker is killed at the deadline.
+    rt.config.limits.default_timeout_s = 1
+    (workspace / "a.txt").write_text("a" * 34 + "!\n")
+    r = await call(connect, "replace_in_files", {"pattern": "^(a+)+$", "replacement": "x"})
+    assert r.is_error
+    assert "did not finish within 1s" in text(r)
+    assert (workspace / "a.txt").read_text() == "a" * 34 + "!\n"
+
+
+async def test_replace_works_across_batches(connect, workspace, monkeypatch):
+    import dev_link_mcp.tools.search as search_module
+
+    monkeypatch.setattr(search_module, "_REPLACE_BATCH_BYTES", 10)
+    for i in range(5):
+        (workspace / f"f{i}.txt").write_text(f"hello {i}\n")
+    (workspace / "skip.txt").write_text("nothing\n")
+    r = await call(connect, "replace_in_files", {"pattern": "hello", "replacement": "bye", "dry_run": False})
+    assert not r.is_error, text(r)
+    assert [(workspace / f"f{i}.txt").read_text() for i in range(5)] == [f"bye {i}\n" for i in range(5)]
+    assert (workspace / "skip.txt").read_text() == "nothing\n"

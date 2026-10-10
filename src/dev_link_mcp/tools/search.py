@@ -6,10 +6,8 @@ import asyncio
 import base64
 import difflib
 import json
-import os
 import re
 import shutil
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -18,6 +16,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
 
+from dev_link_mcp import patterns
 from dev_link_mcp.runtime import Runtime
 from dev_link_mcp.sandbox import RunResult
 from dev_link_mcp.tools.base import ToolGroup
@@ -29,6 +28,8 @@ _MAX_LINE_CHARS = 500
 _RG_CAPTURE_BYTES = 32_000_000
 _MAX_RESULTS_CAP = 5000
 _MAX_REPLACE_FILES = 20_000
+# replace_in_files reads and matches files in batches of about this size.
+_REPLACE_BATCH_BYTES = 8 * 1024 * 1024
 
 _HIDDEN_FIELD = Field(description="Also search hidden files and directories (dot-files). .git is always skipped.")
 _IGNORED_FIELD = Field(description="Also search files excluded by .gitignore/.ignore (node_modules, build output...).")
@@ -167,20 +168,6 @@ def _diff(rel: str, old: str, new: str) -> str:
     return "".join(line if line.endswith("\n") else line + "\n\\ No newline at end of file\n" for line in lines)
 
 
-def _write_atomic(path: Path, content: str) -> None:
-    """Replace the file in one step so a crash never leaves it half-written; keeps its permissions."""
-    mode = path.stat().st_mode
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(content.encode("utf-8"))
-        os.chmod(tmp, mode & 0o7777)
-        os.replace(tmp, path)
-    except BaseException:
-        Path(tmp).unlink(missing_ok=True)
-        raise
-
-
 def _register(mcp: MCPServer, rt: Runtime) -> None:
     def require_rg() -> None:
         if shutil.which("rg", path=rt.sandbox.path) is None:
@@ -310,16 +297,17 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
             footer = f"showing {max_results} of {len(files)} files; raise max_results or use a narrower pattern"
         return clip("\n".join(files[:max_results]) + f"\n\n{footer}{warning}", rt.config.limits.max_output_bytes)
 
-    def plan_replacements(
-        files: list[str], compiled: re.Pattern[str], replacement: str, literal: bool
-    ) -> tuple[list[_Replacement], list[str]]:
-        """Compute new contents for every file with a match. Returns (replacements, skipped notes)."""
+    def read_candidates(files: list[str], start: int, skipped: list[str]) -> tuple[list[tuple[str, Path, str]], int]:
+        """Read UTF-8 text files from `files[start:]` as (rel, resolved path, text) until about
+        _REPLACE_BATCH_BYTES are read. Returns them with the index to continue from, and appends a
+        note to `skipped` for each file left out."""
         max_bytes = rt.config.limits.max_read_bytes
-        planned: list[_Replacement] = []
-        skipped: list[str] = []
-        # A literal replacement must not interpret backslashes or group references.
-        repl: Any = (lambda _m: replacement) if literal else replacement
-        for rel in files:
+        candidates: list[tuple[str, Path, str]] = []
+        total = 0
+        index = start
+        while index < len(files) and total < _REPLACE_BATCH_BYTES:
+            rel = files[index]
+            index += 1
             try:
                 resolved = rt.workspace.resolve(rel, must_exist=True)
             except ToolError:
@@ -328,10 +316,15 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
             if not resolved.is_file():
                 continue
             try:
-                if resolved.stat().st_size > max_bytes:
-                    skipped.append(f"{rel}: larger than {max_bytes} bytes")
-                    continue
-                data = resolved.read_bytes()
+                with rt.workspace.open_file(resolved) as handle:
+                    # Read one byte past the limit: the file may have grown since the fstat.
+                    data = handle.read(max_bytes + 1)
+                    if len(data) > max_bytes:
+                        skipped.append(f"{rel}: larger than {max_bytes} bytes")
+                        continue
+            except ToolError as exc:
+                skipped.append(f"{rel}: {exc}")
+                continue
             except OSError as exc:
                 skipped.append(f"{rel}: {exc.strerror or exc}")
                 continue
@@ -342,13 +335,9 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
             except UnicodeDecodeError:
                 skipped.append(f"{rel}: not UTF-8 text")
                 continue
-            try:
-                new, count = compiled.subn(repl, old)
-            except (re.error, IndexError) as exc:
-                raise ToolError(f"invalid replacement {replacement!r}: {exc}") from exc
-            if count and new != old:
-                planned.append(_Replacement(rel=rel, path=resolved, old=old, new=new, count=count))
-        return planned, skipped
+            candidates.append((rel, resolved, old))
+            total += len(data)
+        return candidates, index
 
     @mcp.tool(annotations=WRITE)
     async def replace_in_files(
@@ -388,7 +377,28 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
         if len(files) > _MAX_REPLACE_FILES:
             raise ToolError(f"{len(files)} files in scope (limit {_MAX_REPLACE_FILES}); narrow path or glob")
 
-        planned, skipped = await asyncio.to_thread(plan_replacements, files, compiled, replacement, not regex)
+        skipped: list[str] = []
+        planned: list[_Replacement] = []
+        # In batches, so only the files that change stay in memory rather than everything in scope.
+        start = 0
+        while start < len(files):
+            candidates, start = await asyncio.to_thread(read_candidates, files, start, skipped)
+            try:
+                # The pattern comes from the agent and may backtrack for hours; see patterns.py.
+                results = await patterns.subn(
+                    compiled,
+                    replacement,
+                    [old for _, _, old in candidates],
+                    literal=not regex,
+                    timeout_s=rt.config.limits.default_timeout_s,
+                )
+            except (re.error, IndexError) as exc:
+                raise ToolError(f"invalid replacement {replacement!r}: {exc}") from exc
+            planned += [
+                _Replacement(rel=rel, path=resolved, old=old, new=new, count=count)
+                for (rel, resolved, old), (new, count) in zip(candidates, results, strict=True)
+                if count and new != old
+            ]
         notes = ""
         if skipped:
             notes = "\n\nskipped:\n" + "\n".join(skipped[:50])
@@ -408,12 +418,14 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
 
             def write_all() -> None:
                 for r in planned:
-                    _write_atomic(r.path, r.new)
+                    # Writes through a descriptor walk: a directory swapped for a symlink since the
+                    # read fails here instead of redirecting the write outside the workspace.
+                    rt.workspace.write_file(r.path, r.new.encode("utf-8"))
                     written.append(r.rel)
 
             try:
                 await asyncio.to_thread(write_all)
-            except OSError as exc:
+            except (OSError, ToolError) as exc:
                 done = ", ".join(written) or "none"
                 raise ToolError(f"write failed ({exc}); files already changed: {done}") from exc
             header = f"{total} replacements written in {len(planned)} files."

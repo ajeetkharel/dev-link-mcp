@@ -1,7 +1,10 @@
 import asyncio
+import os
 import secrets
 import signal
 import socket
+import sqlite3
+import subprocess
 import time
 from pathlib import Path
 
@@ -10,6 +13,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from dev_link_mcp.audit import AuditStore
 from dev_link_mcp.config import Config
+from dev_link_mcp.patterns import PatternStuck
 from dev_link_mcp.processes import ProcessManager, _port_open
 from dev_link_mcp.sandbox import Sandbox
 
@@ -302,3 +306,99 @@ async def test_stop_soon_after_start_leaves_nothing_running(tmp_path, workspace,
     await asyncio.sleep(0.2)
     alive = [e for e in Path("/proc").iterdir() if e.name.isdigit() and marker in _cmdline(e)]
     assert not alive
+
+
+async def test_send_input_refused_while_earlier_input_is_unread(pm, workspace):
+    proc = await pm.start("sleep 3111", cwd=workspace)
+    with pytest.raises(ToolError, match="did not read its input"):
+        await pm.send_input(proc.id, "x" * 2_000_000, timeout_s=0.3)
+    # The unread rest sits in server memory; more input would only grow it.
+    with pytest.raises(ToolError, match=r"has not read \d+ bytes of earlier input"):
+        await pm.send_input(proc.id, "more", timeout_s=0.3)
+    await pm.stop(proc.id)
+
+
+async def test_concurrent_starts_respect_the_process_limit(tmp_path, workspace, rt):
+    pm = ProcessManager(rt.sandbox, rt.audit, tmp_path / "pm-state", max_processes=2)
+    try:
+        results = await asyncio.gather(
+            *(pm.start("sleep 3112", cwd=workspace) for _ in range(5)), return_exceptions=True
+        )
+        started = [r for r in results if not isinstance(r, BaseException)]
+        refused = [r for r in results if isinstance(r, ToolError)]
+        assert len(started) == 2 and len(refused) == 3, results
+    finally:
+        await pm.shutdown()
+
+
+async def test_only_the_most_recent_exited_processes_are_kept(tmp_path, workspace, rt, monkeypatch):
+    monkeypatch.setattr(ProcessManager, "keep_exited", 3)
+    pm = ProcessManager(rt.sandbox, rt.audit, tmp_path / "pm-state", max_processes=8)
+    try:
+        server = await pm.start("sleep 3113", cwd=workspace)
+        for _ in range(5):
+            managed = await pm.start("true", cwd=workspace)
+            assert managed.watcher is not None
+            await managed.watcher
+        ids = [p["id"] for p in pm.list()]
+        # The running one is never dropped; of the exited ones only the newest three stay.
+        assert ids == ["p1", "p4", "p5", "p6"]
+        with pytest.raises(ToolError, match="unknown process id 'p2'"):
+            pm.read_log("p2")
+        assert server.running
+    finally:
+        await pm.shutdown()
+
+
+async def test_stop_gives_up_on_a_process_that_does_not_die(tmp_path, workspace, monkeypatch):
+    config = Config(workspace=workspace, state_dir=tmp_path / "state4").finalize()
+    config.sandbox.backend = "none"
+    audit = AuditStore(config.state_dir, secrets=[], result_bytes=1000)
+    pm = ProcessManager(Sandbox(config), audit, config.state_dir, max_processes=4)
+    monkeypatch.setattr("dev_link_mcp.processes.REAP_TIMEOUT_S", 0.3)
+    try:
+        proc = await pm.start("trap '' TERM; echo ready; while true; do sleep 0.1; done", cwd=workspace)
+        await _wait_log(pm, proc.id, "ready")
+
+        async def never() -> int:
+            await asyncio.Event().wait()
+            return 0
+
+        # Stands in for a process stuck in uninterruptible sleep, which even SIGKILL cannot end.
+        monkeypatch.setattr(proc.proc, "wait", never)
+        started = time.monotonic()
+        assert await pm.stop(proc.id, grace_s=0.2) is None
+        assert time.monotonic() - started < 2
+    finally:
+        monkeypatch.undo()
+        await pm.shutdown()
+        audit.close()
+
+
+async def test_wait_for_stops_waiting_on_a_catastrophic_pattern(pm, workspace):
+    proc = await pm.start("echo " + "a" * 34 + "!; sleep 3114", cwd=workspace)
+    await _wait_log(pm, proc.id, "!")
+    started = time.monotonic()
+    with pytest.raises(PatternStuck):
+        await pm.wait_for(proc.id, pattern=r"^(a+)+$", timeout_s=0.5)
+    assert time.monotonic() - started < 1.5
+    assert "matched" in await pm.wait_for(proc.id, pattern=r"a!", timeout_s=10)
+    await pm.stop(proc.id)
+
+
+async def test_failed_registration_kills_the_started_process(pm, workspace, monkeypatch):
+    marker = f"sleep {7400 + os.getpid() % 100}"
+
+    def broken(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database or disk is full")
+
+    monkeypatch.setattr(pm.audit, "start", broken)
+    with pytest.raises(sqlite3.OperationalError):
+        await pm.start(marker, cwd=workspace)
+    assert pm.list() == []
+    for _ in range(50):
+        if subprocess.run(["pgrep", "-f", marker], capture_output=True).returncode != 0:
+            break
+        await asyncio.sleep(0.1)
+    else:
+        pytest.fail(f"{marker} survived a failed start")

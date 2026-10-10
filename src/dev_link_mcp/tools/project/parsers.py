@@ -5,11 +5,16 @@ when the output is not its format, add it to `_PARSERS` (order matters: the firs
 wins, so more specific formats go first), and add a `SAMPLES` row in tests/test_project.py.
 """
 
+import os
 import re
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from mcp.server.mcpserver.exceptions import ToolError
+
+from dev_link_mcp.workspace import open_regular
 
 _MAX_FAILURES = 50
 _MAX_MESSAGE = 500
@@ -368,9 +373,13 @@ def parse_junit_reports(cwd: Path, confine: Path | None, since: float) -> SuiteS
     for path in files:
         try:
             # The reports come from the workspace; Python's bundled expat refuses entity
-            # expansion bombs, and the size cap bounds the rest.
-            root = ET.parse(path).getroot()  # noqa: S314
-        except (ET.ParseError, OSError):
+            # expansion bombs, and the size cap bounds the rest. Opened through a symlink-refusing
+            # walk so a directory swapped in after the checks above cannot point outside.
+            with open_regular(path, confine) as handle:
+                if os.fstat(handle.fileno()).st_size > _MAX_JUNIT_BYTES:
+                    continue
+                root = ET.parse(handle).getroot()  # noqa: S314
+        except (ET.ParseError, OSError, ToolError):
             continue
         if root.tag not in ("testsuite", "testsuites"):
             continue

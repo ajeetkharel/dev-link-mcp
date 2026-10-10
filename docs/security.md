@@ -50,7 +50,8 @@ Some tools do not run in the sandbox, and the network setting means something di
 
 - `http_request`, `fetch_url`, `download_file` and the browser run in the server process. With
   the network off they may only reach loopback addresses, and that is the host's loopback. So
-  they can still reach services listening on `127.0.0.1` on your machine.
+  they can still reach services listening on `127.0.0.1` on your machine. The HTTP tools resolve
+  `localhost` and `*.localhost` names themselves and connect only if every address is loopback.
 - The docker group ignores `sandbox.network`: containers get Docker's normal networking.
 
 ## What the bubblewrap sandbox does
@@ -88,9 +89,14 @@ What it does not protect against:
 - Resource use. Without `limits.memory_mb` and `limits.max_pids` a command can use all memory
   and processes your user can.
 
-Tools that run on the host read files the agent wrote. Checkpoints run host `git` against the
-workspace with your git config and hooks turned off. The docker group checks compose files
-before it uses them. These checks are code that can have bugs.
+Tools that run on the host read files the agent wrote. Host-side file tools open workspace paths
+one directory at a time and refuse symlinks while they do, so a directory that a sandboxed process
+swaps for a symlink after the path check fails the call instead of reaching the host. SQLite opens
+files by path itself, so the data tools check afterwards that it opened the file they checked; it
+can still create or remove its `-journal` and `-wal` files in a swapped directory. Checkpoints run
+host `git` against the workspace with your git config and hooks turned off; git reads and writes
+the workspace by path, so the symlink check above does not cover it. The docker group checks
+compose files before it uses them. These checks are code that can have bugs.
 
 ## No sandbox
 
@@ -109,8 +115,15 @@ The docker group is off unless you enable it (`--enable docker`). The docker dae
 root, so access to it is root-equivalent on the host. The docker tools run the host `docker`
 CLI outside bubblewrap. They refuse privileged mode, host namespaces, extra capabilities,
 devices, bind mounts outside the workspace and the docker socket, and only touch containers
-labelled with this workspace. Treat those checks as a guard against mistakes, not as a security
-boundary: enable docker only for an agent you would trust with root.
+labelled with this workspace. compose runs the resolved config that passed the check, with `.env`,
+`include` and `extends` already applied, so changing those files after the check has no effect.
+The daemon still follows symlinks in bind mount paths when it starts a container. Treat those
+checks as a guard against mistakes, not as a security boundary: enable docker only for an agent
+you would trust with root.
+
+When the server stops it stops (but does not remove) the detached containers it started, and
+every container of the compose projects it ran `up` or `restart` on, including services of
+those projects started earlier.
 
 ## Plugins
 
@@ -125,8 +138,8 @@ workspace.
 
 ## Audit log and dashboard
 
-Every tool call is recorded with its arguments, its result (up to `audit.result_bytes`, default
-256 kB) and any error, in `audit.sqlite3` and `audit.jsonl` in the state dir. Background process
+Every tool call is recorded with its arguments and its result (each up to `audit.result_bytes`,
+default 256 kB) and any error, in `audit.sqlite3` and `audit.jsonl` in the state dir. Background process
 output goes to `processes/` there. The dashboard shows all of it, and its Files tab shows every
 file in the workspace except `.git` internals.
 

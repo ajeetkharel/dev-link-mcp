@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import codecs
 import contextlib
+import logging
 import re
 import signal
 import socket
@@ -15,11 +16,22 @@ from typing import Any
 
 from mcp.server.mcpserver.exceptions import ToolError
 
+from dev_link_mcp import patterns
 from dev_link_mcp.audit import AuditStore
 from dev_link_mcp.sandbox import Sandbox, kill_group_rest, kill_tree
 
+log = logging.getLogger(__name__)
+
 # Subdirectory of the state dir that holds one log file per background process.
 LOG_DIR = "processes"
+# How long stop() waits for a process to exit after SIGKILL. One stuck in the kernel (D state)
+# ignores even SIGKILL and must not hold up the server's shutdown.
+REAP_TIMEOUT_S = 5.0
+# Input a process has not read yet stays in server memory; past this, more input is refused.
+MAX_UNREAD_INPUT = 1024 * 1024
+# Least time one pattern search gets near the end of a wait, so a normal pattern is not
+# reported as a runaway just because little of the wait was left.
+_MIN_SEARCH_S = 0.5
 
 
 class ProcessExited(ToolError):
@@ -63,6 +75,10 @@ class ManagedProcess:
 class ProcessManager:
     """Owns every background process; all of them are killed when the server stops."""
 
+    # Exited processes kept for list_processes and process_output; older ones are forgotten
+    # (their log files stay on disk until the startup cleanup).
+    keep_exited = 50
+
     def __init__(self, sandbox: Sandbox, audit: AuditStore, state_dir: Path, max_processes: int):
         self.sandbox = sandbox
         self.audit = audit
@@ -71,6 +87,8 @@ class ProcessManager:
         self.max_processes = max_processes
         self._procs: dict[str, ManagedProcess] = {}
         self._counter = 0
+        # start() calls between the limit check and registration; they count against the limit.
+        self._starting = 0
         self._log_watch: asyncio.Task[None] | None = None
 
     async def start(
@@ -84,30 +102,40 @@ class ProcessManager:
     ) -> ManagedProcess:
         """Start `command` under bash in the sandbox. Raises ToolError at the process limit."""
         running = [p for p in self._procs.values() if p.running]
-        if len(running) >= self.max_processes:
+        if len(running) + self._starting >= self.max_processes:
             raise ToolError(f"process limit reached ({self.max_processes}); stop one first")
         self._counter += 1
         pid_name = f"p{self._counter}"
         log_path = self.log_dir / f"{pid_name}-{int(time.time())}.log"
+        self._starting += 1
         try:
             with log_path.open("ab") as log_file:
                 proc = await self.sandbox.spawn(self.sandbox.shell_argv(command), cwd=cwd, log_file=log_file, env=env)
         except BaseException:
             log_path.unlink(missing_ok=True)
             raise
-        event_id = self.audit.start(
-            "process", name or pid_name, {"id": pid_name, "command": command, "cwd": str(cwd)}, session=session
-        )
-        managed = ManagedProcess(
-            id=pid_name,
-            name=name or pid_name,
-            command=command,
-            cwd=str(cwd),
-            log_path=log_path,
-            proc=proc,
-            event_id=event_id,
-        )
-        managed.watcher = asyncio.create_task(self._watch(managed))
+        finally:
+            self._starting -= 1
+        try:
+            event_id = self.audit.start(
+                "process", name or pid_name, {"id": pid_name, "command": command, "cwd": str(cwd)}, session=session
+            )
+            managed = ManagedProcess(
+                id=pid_name,
+                name=name or pid_name,
+                command=command,
+                cwd=str(cwd),
+                log_path=log_path,
+                proc=proc,
+                event_id=event_id,
+            )
+            managed.watcher = asyncio.create_task(self._watch(managed))
+        except BaseException:
+            # Not registered yet, so nothing else would ever stop it (an audit write can fail on a
+            # full disk). The unreaped leader keeps its pid, so reap() cannot hit a reused one.
+            kill_tree(proc.pid)
+            self.sandbox.reap(proc.pid)
+            raise
         self._procs[pid_name] = managed
         self._notify(managed, "started")
         self.watch_logs()
@@ -115,6 +143,9 @@ class ProcessManager:
 
     async def _watch(self, managed: ManagedProcess) -> None:
         code = await managed.proc.wait()
+        # Without a PID namespace, `cmd &` jobs and setsid children outlive bash; end them with
+        # it, as bubblewrap does, since nothing else tracks them.
+        self.sandbox.reap(managed.proc.pid)
         managed.exit_code = code
         managed.ended = time.time()
         tail, _ = self.read_log(managed.id, tail_lines=40)
@@ -124,6 +155,13 @@ class ProcessManager:
             result=f"exit_code={code}\n{tail}",
         )
         self._notify(managed, "stopped" if managed.stopping else "exited")
+        self._forget_old()
+
+    def _forget_old(self) -> None:
+        """Drop the processes that exited longest ago beyond `keep_exited`; running ones always stay."""
+        exited = sorted((p for p in self._procs.values() if not p.running), key=lambda p: p.ended or 0.0)
+        for managed in exited[: max(0, len(exited) - self.keep_exited)]:
+            del self._procs[managed.id]
 
     def _notify(self, managed: ManagedProcess, change: str) -> None:
         live = self.audit.live
@@ -195,13 +233,20 @@ class ProcessManager:
     async def send_input(self, process_id: str, text: str, timeout_s: float = 10.0) -> None:
         """Write `text` to the process's stdin.
 
-        Raises ToolError if the process is not running, closed stdin, or does not read the
-        input within `timeout_s` (a full pipe would otherwise block the call forever). On a
-        timeout the unread input stays queued and is delivered if the process reads later.
+        Raises ToolError if the process is not running, closed stdin, does not read the
+        input within `timeout_s` (a full pipe would otherwise block the call forever), or has
+        not yet read more than MAX_UNREAD_INPUT bytes of earlier input. On a timeout the unread
+        input stays queued in server memory and is delivered if the process reads later.
         """
         managed = self.get(process_id)
         if not managed.running or managed.proc.stdin is None:
             raise ToolError(f"process {process_id} is not running")
+        unread = managed.proc.stdin.transport.get_write_buffer_size()
+        if unread > MAX_UNREAD_INPUT:
+            raise ToolError(
+                f"process {process_id} has not read {unread} bytes of earlier input yet;"
+                " send more once it reads them, or stop it"
+            )
         try:
             managed.proc.stdin.write(text.encode())
             async with asyncio.timeout(timeout_s):
@@ -214,7 +259,11 @@ class ProcessManager:
             ) from None
 
     async def stop(self, process_id: str, grace_s: float = 5.0) -> int | None:
-        """SIGTERM, then SIGKILL after `grace_s`. Returns the exit code."""
+        """SIGTERM, then SIGKILL after `grace_s`. Returns the exit code.
+
+        Returns None, with a warning logged, when the process is still there REAP_TIMEOUT_S
+        after the SIGKILL (stuck in the kernel); it then stays listed as running.
+        """
         managed = self.get(process_id)
         if managed.running:
             managed.stopping = True
@@ -224,7 +273,12 @@ class ProcessManager:
                     await managed.proc.wait()
             except TimeoutError:
                 kill_tree(managed.proc.pid, signal.SIGKILL)
-                await managed.proc.wait()
+                try:
+                    async with asyncio.timeout(REAP_TIMEOUT_S):
+                        await managed.proc.wait()
+                except TimeoutError:
+                    log.warning("process %s (pid %s) did not exit after SIGKILL", process_id, managed.proc.pid)
+                    return None
             # A bwrap init forked just after the SIGTERM ignores it and has no parent-death
             # signal yet, so it can outlive its bwrap; it is still in this group.
             kill_group_rest(managed.proc.pid)
@@ -237,8 +291,9 @@ class ProcessManager:
     ) -> str:
         """Block until the log matches `pattern`, `port` accepts TCP connections, or the process exits.
 
-        Returns a short description of what happened. Raises ToolError on timeout, and
-        ProcessExited when the process exits nonzero on its own while a pattern or port was awaited.
+        Returns a short description of what happened. Raises ToolError on timeout,
+        ProcessExited when the process exits nonzero on its own while a pattern or port was
+        awaited, and PatternStuck when matching `pattern` itself outlasts the timeout.
         """
         managed = self.get(process_id)
         try:
@@ -250,10 +305,11 @@ class ProcessManager:
         while time.monotonic() < deadline:
             if regex:
                 text, _ = self.read_log(process_id, tail_lines=500, max_bytes=500_000)
-                # The pattern comes from the agent; a catastrophic one must not block the event loop.
-                match = await asyncio.to_thread(regex.search, text)
-                if match:
-                    return f"log matched {pattern!r}: {match.group(0)[:200]}"
+                # The pattern comes from the agent and may backtrack for hours; see patterns.py.
+                remaining = max(deadline - time.monotonic(), _MIN_SEARCH_S)
+                match = await patterns.search(regex, text, timeout_s=remaining)
+                if match is not None:
+                    return f"log matched {pattern!r}: {match[:200]}"
             # An exited process cannot own the port; whatever answers there is another program.
             # A process that is about to fail may still be alive on the first sighting, so the
             # port must be open on two polls in a row with the process running both times.

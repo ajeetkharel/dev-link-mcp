@@ -59,7 +59,8 @@ Everything lives under `src/dev_link_mcp/`.
 | `tools/` | Built-in tool groups, one module or package each, and `tools/__init__.py`, which loads built-ins and plugins and registers them. `tools/project/` is split into detection, test-output parsers and tool registration. |
 | `processes.py` | `ProcessManager`: background processes, their log files and cleanup. |
 | `runtime.py` | `Runtime`, the handles every group receives. |
-| `workspace.py` | Path confinement and the `.dev-link` directory. |
+| `workspace.py` | Path confinement, symlink-refusing file access through directory descriptors, and the `.dev-link` directory. |
+| `patterns.py` | Agent regexes (`wait_for_process`, `replace_in_files`) in a worker process that is killed at its deadline. |
 | `web.py`, `browse.py` | Dashboard routes and the read-only file browser behind its Files tab. |
 | `dashboard/` | The dashboard page, CSS and ES modules. |
 | `private.py` | Opens files as 0600 before writing secrets into them. |
@@ -83,7 +84,7 @@ Each workspace has a state dir, by default `$XDG_STATE_HOME/dev-link-mcp/<folder
 | `server.lock` | flock held by the running server, with its PID. |
 | `connection.json` | MCP and dashboard URLs, workspace and PID (0600); removed on stop. |
 | `server.log`, `tunnel.log` | Output of a background server and of cloudflared (0600). The banner in `server.log` contains the URLs with the token. |
-| `audit.sqlite3`, `audit.jsonl` | Every event; the dashboard reads SQLite, the JSONL is for grep and log shippers. |
+| `audit.sqlite3`, `audit.jsonl` | Every event; the dashboard reads SQLite, the JSONL is for grep and log shippers. `args` is a JSON object, or a string when it was clipped to `audit.result_bytes`. |
 | `processes/` | One log file per background process. |
 | `home/` | Private home directory mounted over your real home inside the sandbox. Persists between runs. |
 | `tmp/` | Mounted as `/tmp` inside the sandbox; emptied at every start. |

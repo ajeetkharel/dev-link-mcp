@@ -12,8 +12,9 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from mcp.server.mcpserver.exceptions import ToolError
 
-from dev_link_mcp.workspace import Workspace
+from dev_link_mcp.workspace import Workspace, open_regular, read_at_most
 
 # Command kinds a detector can fill. `test_target` holds a `{target}` placeholder for
 # running one test file, package or name.
@@ -122,10 +123,18 @@ def _read_text(path: Path, det: Detection) -> str | None:
         det.warnings.append(f"{path.name} is not a regular file; skipped")
         return None
     try:
-        if real.stat().st_size > _MAX_MANIFEST_BYTES:
-            det.warnings.append(f"{path.name} is larger than {_MAX_MANIFEST_BYTES} bytes; skipped")
-            return None
-        return real.read_text(encoding="utf-8", errors="replace")
+        # Opened through a symlink-refusing walk, so a directory swapped in after the checks
+        # above cannot point the read outside the workspace.
+        with open_regular(real, det.confine) as handle:
+            too_large = os.fstat(handle.fileno()).st_size > _MAX_MANIFEST_BYTES
+            data = None if too_large else read_at_most(handle, _MAX_MANIFEST_BYTES)
+            if data is None:
+                det.warnings.append(f"{path.name} is larger than {_MAX_MANIFEST_BYTES} bytes; skipped")
+                return None
+            return data.decode("utf-8", errors="replace")
+    except ToolError as exc:
+        det.warnings.append(f"cannot read {path.name}: {exc}")
+        return None
     except OSError as exc:
         det.warnings.append(f"cannot read {path.name}: {exc.strerror or exc}")
         return None
@@ -725,24 +734,27 @@ def _scan(root: Path, det: Detection, workspace: Workspace) -> None:
     """Count source files per language and list nested directories that carry manifests."""
     counts: dict[str, int] = {}
     seen = 0
-    for dirpath, dirnames, filenames in os.walk(root):
-        here = Path(dirpath)
-        depth = len(here.relative_to(root).parts)
-        dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_DIRS and not d.startswith("."))
-        if depth >= _MAX_SCAN_DEPTH:
-            dirnames[:] = []
-        if 0 < depth <= 2:
-            found = sorted(f for f in filenames if f in _MANIFEST_NAMES or f.endswith(_DOTNET_SUFFIXES))
-            if found:
-                det.subprojects.append({"path": workspace.rel(here), "manifests": found})
-        for name in filenames:
-            seen += 1
-            language = _EXTENSIONS.get(os.path.splitext(name)[1].lower())
-            if language:
-                counts[language] = counts.get(language, 0) + 1
-        if seen >= _MAX_SCAN_FILES:
-            det.warnings.append(f"language scan stopped after {_MAX_SCAN_FILES} files")
-            break
+    # fwalk lists each directory through a descriptor and never follows symlinks, even ones
+    # swapped in during the walk.
+    with workspace.dir_fd(root) as top:
+        for dirpath, dirnames, filenames, _ in os.fwalk(".", dir_fd=top):
+            here = root / dirpath
+            depth = len(here.relative_to(root).parts)
+            dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_DIRS and not d.startswith("."))
+            if depth >= _MAX_SCAN_DEPTH:
+                dirnames[:] = []
+            if 0 < depth <= 2:
+                found = sorted(f for f in filenames if f in _MANIFEST_NAMES or f.endswith(_DOTNET_SUFFIXES))
+                if found:
+                    det.subprojects.append({"path": workspace.rel(here), "manifests": found})
+            for name in filenames:
+                seen += 1
+                language = _EXTENSIONS.get(os.path.splitext(name)[1].lower())
+                if language:
+                    counts[language] = counts.get(language, 0) + 1
+            if seen >= _MAX_SCAN_FILES:
+                det.warnings.append(f"language scan stopped after {_MAX_SCAN_FILES} files")
+                break
     manifest_langs = det.languages
     ranked = sorted(counts, key=lambda lang: -counts[lang])
     det.languages = ranked + [lang for lang in manifest_langs if lang not in counts]

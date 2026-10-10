@@ -380,3 +380,14 @@ async def test_wait_for_process_port_held_by_another_program_is_not_success_afte
     assert "accepting connections" not in text(started)
     assert "exited with code 1" in text(started)
     assert "status=exited(1)" in text(started)
+
+
+async def test_wait_for_process_reports_a_runaway_pattern(connect):
+    async with connect("processes") as client:
+        await client.call_tool("start_process", {"command": "echo " + "a" * 34 + "!; sleep 30"})
+        r = await client.call_tool("wait_for_process", {"id": "p1", "pattern": "^(a+)+$", "timeout_s": 0.5})
+        assert r.is_error
+        # Not the generic wait timeout: the agent needs to know its pattern is the problem.
+        assert "did not finish" in text(r) and "backtracking" in text(r)
+        r = await client.call_tool("wait_for_process", {"id": "p1", "pattern": "a!", "timeout_s": 5})
+        assert not r.is_error, text(r)

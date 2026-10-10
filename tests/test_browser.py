@@ -54,6 +54,8 @@ class _Handler(BaseHTTPRequestHandler):
         parts = urlsplit(self.path)
         pages = {"/": INDEX, "/next": NEXT, "/late": LATE, "/external": EXTERNAL, "/throws": THROWS}
         pages["/chatty"] = CHATTY
+        if parts.path == "/slow":
+            time.sleep(3)
         if parts.path == "/redirect-out":
             self.send_response(302)
             self.send_header("Location", "http://203.0.113.7/landing")
@@ -543,3 +545,107 @@ async def test_shutdown_cancels_the_idle_timer(rt):
         await group.shutdown()
         assert timer.cancelled()
         assert group.host.idle_task is None and group.host.playwright is None
+
+
+# --- page and context lifetime ------------------------------------------------------------
+
+
+SELF_CLOSE = "() => { setTimeout(() => window.close()); }"
+
+
+def _chromium_pages(host) -> int:
+    """Pages Chromium really has open, tracked or not."""
+    return sum(len(c.pages) for c in host.browser.contexts)
+
+
+async def test_popups_beyond_the_page_limit_are_closed_and_reported(rt, site):
+    mcp, (group,) = build_server(rt, "browser", settings={"browser": {"max_pages": 2, "idle_timeout_s": 0}})
+    host = group.host
+    try:
+        async with Client(mcp) as client:
+            pid = (await open_page(client, site + "/"))["page_id"]
+            script = "() => { for (let i = 0; i < 5; i++) window.open('about:blank'); }"
+            await call(client, "browser_eval", {"page_id": pid, "script": script})
+            await _wait_until(lambda: _chromium_pages(host) == 2 and len(host.pages) == 2)
+            await asyncio.sleep(0.5)
+            assert len(host.pages) == 2
+            assert _chromium_pages(host) == 2
+            out = text(await call(client, "browser_console", {"page_id": pid}))
+            assert out.count("2 pages are already open") == 4
+    finally:
+        await group.shutdown()
+
+
+async def test_page_that_closes_itself_frees_its_context(rt):
+    mcp, (group,) = build_server(rt, "browser", settings={"browser": {"idle_timeout_s": 0}})
+    host = group.host
+    try:
+        async with Client(mcp) as client:
+            pid = (await open_page(client, "about:blank"))["page_id"]
+            await open_page(client, "about:blank")
+            assert len(host.browser.contexts) == 2
+            # A popup keeps the shared context alive after its opener closes itself.
+            await call(client, "browser_eval", {"page_id": pid, "script": "() => { window.open('about:blank'); }"})
+            await _wait_until(lambda: len(host.pages) == 3)
+            await call(client, "browser_eval", {"page_id": pid, "script": SELF_CLOSE})
+            await _wait_until(lambda: len(host.pages) == 2)
+            assert len(host.browser.contexts) == 2
+            popup = next(s for s in host.pages.values() if s.popup)
+            await popup.page.evaluate(SELF_CLOSE)
+            await _wait_until(lambda: len(host.browser.contexts) == 1)
+            assert len(host.pages) == 1
+    finally:
+        await group.shutdown()
+
+
+async def test_closing_the_last_popup_of_a_closed_opener_frees_the_context(rt):
+    mcp, (group,) = build_server(rt, "browser", settings={"browser": {"idle_timeout_s": 0}})
+    host = group.host
+    try:
+        async with Client(mcp) as client:
+            pid = (await open_page(client, "about:blank"))["page_id"]
+            await call(client, "browser_eval", {"page_id": pid, "script": "() => { window.open('about:blank'); }"})
+            await _wait_until(lambda: len(host.pages) == 2)
+            await call(client, "browser_eval", {"page_id": pid, "script": SELF_CLOSE})
+            await _wait_until(lambda: len(host.pages) == 1)
+            popup = next(iter(host.pages))
+            await call(client, "browser_close", {"page_id": popup})
+            await _wait_until(lambda: len(host.browser.contexts) == 0)
+    finally:
+        await group.shutdown()
+
+
+async def test_cancelled_open_frees_its_page_and_slot(rt, site):
+    mcp, (group,) = build_server(rt, "browser", settings={"browser": {"max_pages": 1, "idle_timeout_s": 0}})
+    host = group.host
+    try:
+        opening = asyncio.create_task(mcp.call_tool("browser_open", {"url": site + "/slow", "timeout_s": 30}))
+        await _wait_until(lambda: len(host.pages) == 1)
+        await asyncio.sleep(0.2)
+        opening.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await opening
+        assert host.pages == {}
+        await _wait_until(lambda: len(host.browser.contexts) == 0)
+        result = await mcp.call_tool("browser_open", {"url": "about:blank"})
+        assert not result.is_error, text(result)
+    finally:
+        await group.shutdown()
+
+
+async def test_concurrent_opens_respect_the_page_limit(rt):
+    mcp, (group,) = build_server(rt, "browser", settings={"browser": {"max_pages": 2, "idle_timeout_s": 0}})
+    host = group.host
+    try:
+        results = await asyncio.gather(
+            *(mcp.call_tool("browser_open", {"url": "about:blank"}) for _ in range(5)), return_exceptions=True
+        )
+        opened = [r for r in results if isinstance(r, types.CallToolResult) and not r.is_error]
+        refused = [r for r in results if not isinstance(r, types.CallToolResult) or r.is_error]
+        assert len(opened) == 2
+        assert len(refused) == 3
+        assert all("close one first" in str(r) for r in refused)
+        assert len(host.pages) == 2
+        assert _chromium_pages(host) == 2
+    finally:
+        await group.shutdown()

@@ -1,4 +1,5 @@
 import json
+import re
 import secrets
 import shutil
 import subprocess
@@ -340,7 +341,10 @@ async def test_foreground_run_reports_exit_code_and_output(connect, workspace, c
     assert not result.is_error
     out = text(result)
     assert "exit_code=4" in out and "out" in out and "err" in out
-    assert "container: dev-link-" in out
+    assert re.search(r"container dev-link-\w+ exited and was removed", out)
+    # --rm: a finished foreground run leaves no exited container behind.
+    label = f"label=dev-link.workspace={workspace.resolve()}"
+    assert sh("ps", "-aq", "--filter", label).stdout.strip() == ""
 
 
 @pytest.mark.docker
@@ -464,6 +468,61 @@ async def test_compose_up_ps_logs_down(connect, workspace, cleanup):
             down = await client.call_tool("compose", {"action": "down", "file": "stack/compose.yaml"})
             assert not down.is_error, text(down)
         assert sh("ps", "-aq", "--filter", f"label=com.docker.compose.project={project}").stdout.strip() == ""
+    finally:
+        sh("compose", "-p", project, "down", "--remove-orphans")
+
+
+@pytest.mark.docker
+async def test_shutdown_stops_only_what_this_server_started(connect, workspace, cleanup):
+    project = f"dev-link-test-{secrets.token_hex(3)}"
+    (workspace / "compose.yaml").write_text(
+        f"name: {project}\nservices:\n  app:\n    image: {IMAGE}\n    command: [sleep, '300']\n"
+    )
+    # Same workspace label, but started by someone else (an earlier server run, say).
+    other = f"dev-link-test-{secrets.token_hex(3)}"
+    label = f"dev-link.workspace={workspace.resolve()}"
+    assert sh("run", "-d", "--label", label, "--name", other, IMAGE, "sleep", "300").returncode == 0
+    try:
+        async with connect("docker") as client:
+            run = await client.call_tool("docker_run", {"image": IMAGE, "command": ["sleep", "300"]})
+            assert not run.is_error, text(run)
+            cid = text(run).split()[2]
+            up = await client.call_tool("compose", {"action": "up"})
+            assert not up.is_error, text(up)
+
+        def running(ref: str) -> str:
+            return sh("inspect", "--format", "{{.State.Running}}", ref).stdout.strip()
+
+        assert running(cid) == "false"
+        assert running(f"{project}-app-1") == "false"
+        assert running(other) == "true"
+    finally:
+        sh("compose", "-p", project, "down", "--remove-orphans")
+
+
+@pytest.mark.docker
+async def test_compose_action_uses_the_checked_file(connect, workspace, monkeypatch, cleanup):
+    project = f"dev-link-test-{secrets.token_hex(3)}"
+    compose = workspace / "compose.yaml"
+    compose.write_text(f"name: {project}\nservices:\n  checked:\n    image: {IMAGE}\n    command: [sleep, '300']\n")
+    real = docker_mod.run_docker
+
+    async def swap_after_check(args, **kwargs):
+        result = await real(args, **kwargs)
+        if "config" in args:
+            # Rewrite the file between the check and the action; the action must not see it.
+            compose.write_text(
+                f"name: {project}\nservices:\n  swapped:\n    image: {IMAGE}\n    command: [sleep, '300']\n"
+            )
+        return result
+
+    monkeypatch.setattr(docker_mod, "run_docker", swap_after_check)
+    try:
+        async with connect("docker") as client:
+            up = await client.call_tool("compose", {"action": "up"})
+            assert not up.is_error, text(up)
+        names = sh("ps", "-a", "--filter", f"label=com.docker.compose.project={project}", "--format", "{{.Names}}")
+        assert names.stdout.split() == [f"{project}-checked-1"]
     finally:
         sh("compose", "-p", project, "down", "--remove-orphans")
 
@@ -663,3 +722,32 @@ async def test_compose_cannot_take_over_foreign_project(connect, workspace, outs
         assert running
     finally:
         sh("compose", "-f", str(outside / "compose.yaml"), "down")
+
+
+@pytest.mark.docker
+async def test_compose_action_uses_the_checked_env_file(connect, workspace, monkeypatch, cleanup):
+    project = f"dev-link-test-{secrets.token_hex(3)}"
+    (workspace / ".env").write_text("V=checked\n")
+    (workspace / "compose.yaml").write_text(
+        f"name: {project}\nservices:\n  app:\n    image: {IMAGE}\n    command: [sleep, '300']\n"
+        "    environment:\n      V: ${V}\n"
+    )
+    real = docker_mod.run_docker
+
+    async def swap_after_check(args, **kwargs):
+        result = await real(args, **kwargs)
+        if "config" in args:
+            # .env is read by path, so the action must run the resolved config, not re-read it.
+            (workspace / ".env").write_text("V=swapped\n")
+        return result
+
+    monkeypatch.setattr(docker_mod, "run_docker", swap_after_check)
+    try:
+        async with connect("docker") as client:
+            up = await client.call_tool("compose", {"action": "up"})
+            assert not up.is_error, text(up)
+        env = sh("inspect", f"{project}-app-1", "--format", "{{json .Config.Env}}")
+        assert "V=checked" in env.stdout
+        assert "V=swapped" not in env.stdout
+    finally:
+        sh("compose", "-p", project, "down", "--remove-orphans")

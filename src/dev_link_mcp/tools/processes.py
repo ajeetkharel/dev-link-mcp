@@ -12,6 +12,7 @@ from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
 
+from dev_link_mcp.patterns import PatternStuck
 from dev_link_mcp.processes import ProcessExited
 from dev_link_mcp.runtime import Runtime
 from dev_link_mcp.tools.base import ToolGroup
@@ -113,6 +114,8 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
         except ProcessExited as exc:
             tail, _ = rt.processes.read_log(process_id, tail_lines=20)
             raise ToolError(f"{exc}; last output:\n{tail or '(no output)'}") from None
+        except PatternStuck:
+            raise
         except ToolError:
             raise ToolError(
                 f"timed out after {timeout_s:g}s waiting for {_wait_target(pattern, port)};"
@@ -172,7 +175,7 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
     @mcp.tool(annotations=READ_ONLY)
     async def list_processes() -> dict[str, Any]:
         """List background processes, running and exited, with id, name, command, cwd, pid,
-        status, uptime and log size."""
+        status, uptime and log size. Only the 50 most recently exited processes are kept."""
         return {"processes": [summary(p["id"]) for p in rt.processes.list()]}
 
     @mcp.tool(annotations=READ_ONLY)
@@ -206,7 +209,8 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
         newline: Annotated[bool, Field(description="Append a newline, like pressing Enter.")] = True,
     ) -> str:
         """Write text to a running background process's stdin (answer a prompt, drive a REPL).
-        Read the reply with process_output."""
+        Read the reply with process_output. Refused while the process has more than
+        1 MiB of earlier input still unread."""
         payload = text + "\n" if newline else text
         await rt.processes.send_input(id, payload)
         return f"sent {len(payload.encode())} bytes to {id}"

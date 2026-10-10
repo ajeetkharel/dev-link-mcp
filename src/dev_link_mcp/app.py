@@ -255,8 +255,8 @@ async def serve(config: Config, *, on_shutdown: Callable[[], None] | None = None
                 on_shutdown()
         finally:
             conn_file.unlink(missing_ok=True)
-            await rt.processes.shutdown()
-            # Groups such as the browser hold processes that must not outlive the server.
-            await toolset.shutdown()
+            # Groups such as the browser hold processes that must not outlive the server. Both run at
+            # once so their grace periods overlap within the 10 s before `dev-link stop` sends SIGKILL.
+            await asyncio.gather(rt.processes.shutdown(), toolset.shutdown())
             rt.audit.record("server", "stop")
             rt.audit.close()

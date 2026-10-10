@@ -8,6 +8,7 @@ Grammars are fetched into the pack's cache the first time a language is used.
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -19,6 +20,7 @@ from pydantic import Field
 from dev_link_mcp.runtime import Runtime
 from dev_link_mcp.tools.base import ToolGroup
 from dev_link_mcp.tools.common import READ_ONLY, clip
+from dev_link_mcp.workspace import read_at_most
 
 # Dependency, build and cache dirs skipped even when no .gitignore lists them.
 _VENDOR_DIRS = (
@@ -195,12 +197,13 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
 
     def read_source(target: Path) -> tuple[str, str | None]:
         """Text and language of a workspace file. Raises ToolError for binary or oversized files."""
-        size = target.stat().st_size
-        if size > limits.max_read_bytes:
-            raise ToolError(
-                f"{rt.workspace.rel(target)} is {size} bytes, over the {limits.max_read_bytes}-byte read limit"
-            )
-        data = target.read_bytes()
+        with rt.workspace.open_file(target) as handle:
+            size = os.fstat(handle.fileno()).st_size
+            data = None if size > limits.max_read_bytes else read_at_most(handle, limits.max_read_bytes)
+            if data is None:
+                raise ToolError(
+                    f"{rt.workspace.rel(target)} is {size} bytes, over the {limits.max_read_bytes}-byte read limit"
+                )
         if _is_binary(data):
             raise ToolError(f"{rt.workspace.rel(target)} is a binary file; use file_info")
         return data.decode("utf-8", errors="replace"), _language_for(target, data[:256])
@@ -411,11 +414,13 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
             failed: set[str] = set()
             for file in files:
                 try:
-                    if file.stat().st_size > limits.max_read_bytes:
-                        skipped["too_large"] += 1
-                        continue
-                    data = file.read_bytes()
-                except OSError:
+                    with rt.workspace.open_file(file) as handle:
+                        too_large = os.fstat(handle.fileno()).st_size > limits.max_read_bytes
+                        data = None if too_large else read_at_most(handle, limits.max_read_bytes)
+                        if data is None:
+                            skipped["too_large"] += 1
+                            continue
+                except (OSError, ToolError):
                     skipped["unreadable"] += 1
                     continue
                 if _is_binary(data):

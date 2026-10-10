@@ -144,8 +144,15 @@ class AuditStore:
     def start(
         self, kind: str, name: str, args: Any = None, *, session: str | None = None, client: str | None = None
     ) -> int:
-        """Insert a running event and notify subscribers. Returns the event id."""
-        args_json = json.dumps(self._redact_value(args), default=str) if args is not None else None
+        """Insert a running event and notify subscribers. Returns the event id.
+
+        `args` is stored as redacted JSON, clipped like results to `result_bytes` (then it is no
+        longer valid JSON and ends with a clipped note).
+        """
+        args_json = None
+        if args is not None:
+            # Arguments can be as large as results (file contents, process input), so they share the budget.
+            args_json, _ = self._clip(json.dumps(self._redact_value(args), default=str))
         with self._lock:
             cur = self._db.execute(
                 "INSERT INTO events(ts, kind, name, session, client, args, status) VALUES (?,?,?,?,?,?,?)",
@@ -384,13 +391,15 @@ class AuditStore:
         tmp = Path(tmp_name)
         dropped = 0
         try:
-            self._jsonl.close()
-            with self.jsonl_path.open("rb") as src, os.fdopen(fd, "wb") as dst:
-                for line in src:
-                    if _older(line, cutoff):
-                        dropped += 1
-                    else:
-                        dst.write(line)
+            # The temp fd is wrapped first so it is closed even when opening the source fails.
+            with os.fdopen(fd, "wb") as dst:
+                self._jsonl.close()
+                with self.jsonl_path.open("rb") as src:
+                    for line in src:
+                        if _older(line, cutoff):
+                            dropped += 1
+                        else:
+                            dst.write(line)
                 if dropped:
                     # On disk before the rename, so a crash cannot swap in an empty file.
                     dst.flush()

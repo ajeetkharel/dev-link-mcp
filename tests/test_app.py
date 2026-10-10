@@ -5,6 +5,7 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import httpx2
@@ -16,10 +17,12 @@ from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 from pydantic import BaseModel
 
+import dev_link_mcp.middleware as middleware
 import dev_link_mcp.tools as tools
 from dev_link_mcp.app import _Server, build, connection_info
+from dev_link_mcp.audit import AuditStore
 from dev_link_mcp.config import Config
-from dev_link_mcp.middleware import result_text
+from dev_link_mcp.middleware import AuditMiddleware, result_text
 from dev_link_mcp.runtime import Runtime
 
 # --- middleware.result_text -------------------------------------------------------------
@@ -60,6 +63,37 @@ def test_result_text_dict_none_and_model():
         value: int = 3
 
     assert result_text(Other()) == (False, '{"value":3}')  # type: ignore[arg-type]
+
+
+# --- middleware.AuditMiddleware -----------------------------------------------------------
+
+
+async def test_client_labels_are_capped_oldest_first(tmp_path, monkeypatch):
+    # Sessions are never announced as closed, so one label per session must not pile up forever.
+    monkeypatch.setattr(middleware, "_MAX_CLIENTS", 3)
+    store = AuditStore(tmp_path, secrets=[], result_bytes=1000)
+    mw = AuditMiddleware(store)
+
+    async def call_next(ctx):
+        return None
+
+    def handshake(session: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            method="initialize",
+            params={"clientInfo": {"name": f"client-{session}", "version": "1"}},
+            request=SimpleNamespace(headers={"mcp-session-id": session}),
+            session=None,
+            protocol_version="2025-06-18",
+        )
+
+    try:
+        for session in ("a", "b", "c", "a", "d"):
+            await mw(handshake(session), call_next)  # type: ignore[arg-type]
+    finally:
+        store.close()
+    # "a" shook hands again, so "b" was the oldest when "d" arrived.
+    assert list(mw._clients) == ["c", "a", "d"]
+    assert mw._clients["a"] == "client-a 1"
 
 
 # --- end-to-end over real HTTP ----------------------------------------------------------

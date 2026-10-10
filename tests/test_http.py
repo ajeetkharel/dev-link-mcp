@@ -313,6 +313,52 @@ async def test_network_off_allows_loopback(connect, rt, server):
     assert not named.is_error
 
 
+def _fake_resolver(monkeypatch, answers: dict[str, list[str]]) -> None:
+    """Make getaddrinfo return the given addresses for the given names; other names resolve normally."""
+    import socket
+
+    real = socket.getaddrinfo
+
+    def fake(host, port, *args, **kwargs):
+        if host in answers:
+            family = {4: socket.AF_INET, 6: socket.AF_INET6}
+            return [
+                (family[ip_version(a)], socket.SOCK_STREAM, 6, "", (a, port) if ":" not in a else (a, port, 0, 0))
+                for a in answers[host]
+            ]
+        return real(host, port, *args, **kwargs)
+
+    def ip_version(address: str) -> int:
+        return 6 if ":" in address else 4
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake)
+
+
+async def test_network_off_localhost_subdomain_resolving_public_is_blocked(connect, rt, monkeypatch):
+    # Without nss-myhostname a *.localhost name can go to DNS and come back with any address.
+    rt.config.sandbox.network = False
+    _fake_resolver(monkeypatch, {"evil.localhost": ["169.254.169.254"], "mixed.localhost": ["127.0.0.1", "10.0.0.1"]})
+    async with connect("http") as client:
+        evil = await client.call_tool("http_request", {"url": "http://evil.localhost/latest/meta-data/"})
+        mixed = await client.call_tool("fetch_url", {"url": "http://mixed.localhost/"})
+    assert evil.is_error
+    assert "169.254.169.254" in text(evil)
+    assert "not only loopback" in text(evil)
+    assert mixed.is_error
+    assert "not only loopback" in text(mixed)
+
+
+async def test_network_off_localhost_subdomain_pinned_to_loopback(connect, rt, server, monkeypatch):
+    # ::1 is tried first and refused (the test server is IPv4 only), then 127.0.0.1 answers.
+    rt.config.sandbox.network = False
+    _fake_resolver(monkeypatch, {"app.localhost": ["::1", "127.0.0.1"]})
+    port = server.rsplit(":", 1)[1]
+    async with connect("http") as client:
+        r = await client.call_tool("http_request", {"url": f"http://app.localhost:{port}/echo"})
+    assert not r.is_error, text(r)
+    assert f'"host": "app.localhost:{port}"' in text(r)
+
+
 async def test_network_off_refused_loopback_explains_namespaces(connect, rt):
     # Sandboxed servers live in their own network namespace when the network is off, so a refused
     # loopback connection usually means the agent is trying to reach one of them.
@@ -520,3 +566,23 @@ async def test_tools_registered_with_open_world_annotations(connect):
     for tool in tools.values():
         assert tool.annotations.open_world_hint is True
     assert tools["fetch_url"].annotations.read_only_hint is True
+
+
+@pytest.mark.parametrize("before", ["make_dirs", "write_file"])
+async def test_download_refuses_a_directory_swapped_for_a_symlink(
+    connect, server, workspace, rt, tmp_path, monkeypatch, before
+):
+    from test_symlink_race import swap_before, swap_dir
+
+    import dev_link_mcp.workspace as workspace_module
+
+    rt.workspace.confined = True
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (workspace / "a").mkdir()
+    swap_before(monkeypatch, workspace_module.Workspace, before, swap_dir(workspace, outside))
+    async with connect("http") as client:
+        r = await client.call_tool("download_file", {"url": f"{server}/binary", "path": "a/authorized_keys"})
+    assert r.is_error
+    assert "replaced by a symlink" in text(r)
+    assert list(outside.iterdir()) == []

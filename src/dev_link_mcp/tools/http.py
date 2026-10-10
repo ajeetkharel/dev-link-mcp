@@ -8,8 +8,8 @@ import asyncio
 import hashlib
 import ipaddress
 import json as jsonlib
-import os
 import re
+import socket
 import tempfile
 import time
 from dataclasses import dataclass
@@ -79,6 +79,53 @@ def _timeout(rt: Runtime, timeout_s: float | None, default_s: float) -> float:
     return value
 
 
+class _LoopbackTransport(httpx.AsyncHTTPTransport):
+    """Transport for network-off requests that pins `localhost` names to the loopback address they resolve to.
+
+    `_check_url` lets `localhost` and `*.localhost` through by name, but without nss-myhostname or an
+    /etc/hosts entry such a name is looked up in DNS and may point anywhere. So the name is resolved
+    here, every answer must be loopback, and the connection goes to that exact address with the
+    original Host header and TLS server name. Raises ToolError for names that do not resolve or
+    resolve to anything but loopback; IP literals pass through unchanged.
+    """
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        host = request.url.host
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            pass
+        else:
+            return await super().handle_async_request(request)
+        try:
+            infos = await asyncio.get_running_loop().getaddrinfo(host, request.url.port, type=socket.SOCK_STREAM)
+        except OSError as exc:
+            raise ToolError(f"could not resolve {host}: {exc}") from exc
+        addresses = list(dict.fromkeys(str(info[4][0]) for info in infos))
+        if not addresses or not all(ipaddress.ip_address(a.split("%", 1)[0]).is_loopback for a in addresses):
+            raise ToolError(
+                f"network access is disabled on this server; {host} resolves to {', '.join(addresses) or 'nothing'},"
+                " not only loopback"
+            )
+        # Try each address in order like a normal connect would, since `localhost` is often ::1 first
+        # while the server listens on 127.0.0.1 only (or the other way round).
+        error: httpx.ConnectError | None = None
+        for address in addresses:
+            pinned = httpx.Request(
+                request.method,
+                request.url.copy_with(host=address),
+                headers=request.headers,
+                stream=request.stream,
+                extensions={**request.extensions, "sni_hostname": host},
+            )
+            try:
+                return await super().handle_async_request(pinned)
+            except httpx.ConnectError as exc:
+                error = exc
+        assert error is not None
+        raise error
+
+
 def _client(rt: Runtime, timeout_s: float, follow_redirects: bool, max_redirects: int) -> httpx.AsyncClient:
     async def guard(request: httpx.Request) -> None:
         # Runs for every hop, so a public server cannot redirect us past the loopback rule.
@@ -90,6 +137,7 @@ def _client(rt: Runtime, timeout_s: float, follow_redirects: bool, max_redirects
         max_redirects=max_redirects,
         # Env proxies would route loopback-only traffic off the machine when the network is off.
         trust_env=rt.config.sandbox.network,
+        transport=None if rt.config.sandbox.network else _LoopbackTransport(),
         event_hooks={"request": [guard]},
     )
 
@@ -316,6 +364,10 @@ def html_to_text(html: str, base_url: str) -> tuple[str, str]:
     return re.sub(r"\s+", " ", parser.title).strip(), parser.text()
 
 
+def _reason(exc: OSError | ToolError) -> str:
+    return (exc.strerror if isinstance(exc, OSError) else None) or str(exc)
+
+
 def _download_name(url: httpx.URL) -> str:
     name = Path(unquote(url.path)).name
     return name if name not in ("", ".", "..") else "download"
@@ -455,45 +507,44 @@ def _register(mcp: MCPServer, rt: Runtime, settings: HttpSettings) -> None:
         if target.is_dir():
             raise ToolError(f"destination is a directory: {rt.workspace.rel(target)}")
         try:
-            await asyncio.to_thread(target.parent.mkdir, parents=True, exist_ok=True)
-            fd, tmp_name = await asyncio.to_thread(tempfile.mkstemp, prefix=".download-", dir=target.parent)
-        except OSError as exc:
-            raise ToolError(f"cannot write to {rt.workspace.rel(target)}: {exc.strerror or exc}") from exc
-        tmp = Path(tmp_name)
+            await asyncio.to_thread(rt.workspace.make_dirs, target.parent)
+        except (OSError, ToolError) as exc:
+            raise ToolError(f"cannot write to {rt.workspace.rel(target)}: {_reason(exc)}") from exc
         digest = hashlib.sha256()
         size = 0
-        try:
-            with os.fdopen(fd, "wb") as fh:
-                try:
-                    async with (
-                        asyncio.timeout(timeout),
-                        _client(rt, timeout, True, max_redirects) as client,
-                        client.stream("GET", parsed) as resp,
-                    ):
-                        if not resp.is_success:
-                            raise ToolError(f"{resp.url} returned HTTP {resp.status_code} {resp.reason_phrase}")
-                        declared = resp.headers.get("content-length")
-                        if declared and declared.isdigit() and int(declared) > max_bytes:
-                            raise ToolError(f"download is {declared} bytes, over max_bytes={max_bytes}")
-                        async for chunk in resp.aiter_bytes():
-                            size += len(chunk)
-                            if size > max_bytes:
-                                raise ToolError(f"download exceeded max_bytes={max_bytes}; nothing was saved")
-                            digest.update(chunk)
-                            await asyncio.to_thread(fh.write, chunk)
-                        final_url = resp.url
-                        content_type = resp.headers.get("content-type", "unknown")
-                except (httpx.TimeoutException, TimeoutError) as exc:
-                    raise ToolError(f"download timed out after {timeout:g}s: {parsed}") from exc
-                except httpx.TooManyRedirects as exc:
-                    raise ToolError(f"more than {max_redirects} redirects: {parsed}") from exc
-                except httpx.HTTPError as exc:
-                    raise ToolError(_failure("download failed", rt, exc)) from exc
-            await asyncio.to_thread(os.replace, tmp, target)
-        finally:
-            # Covers errors and cancellation; after a successful replace the temp name is gone.
-            # Synchronous on purpose: an await here could be skipped by a second cancellation.
-            tmp.unlink(missing_ok=True)  # noqa: ASYNC240
+        # Downloaded into an anonymous temp file outside the workspace, then written into it through
+        # write_file, which refuses symlinks; nothing is created in the workspace on failure.
+        with tempfile.TemporaryFile() as fh:
+            try:
+                async with (
+                    asyncio.timeout(timeout),
+                    _client(rt, timeout, True, max_redirects) as client,
+                    client.stream("GET", parsed) as resp,
+                ):
+                    if not resp.is_success:
+                        raise ToolError(f"{resp.url} returned HTTP {resp.status_code} {resp.reason_phrase}")
+                    declared = resp.headers.get("content-length")
+                    if declared and declared.isdigit() and int(declared) > max_bytes:
+                        raise ToolError(f"download is {declared} bytes, over max_bytes={max_bytes}")
+                    async for chunk in resp.aiter_bytes():
+                        size += len(chunk)
+                        if size > max_bytes:
+                            raise ToolError(f"download exceeded max_bytes={max_bytes}; nothing was saved")
+                        digest.update(chunk)
+                        await asyncio.to_thread(fh.write, chunk)
+                    final_url = resp.url
+                    content_type = resp.headers.get("content-type", "unknown")
+            except (httpx.TimeoutException, TimeoutError) as exc:
+                raise ToolError(f"download timed out after {timeout:g}s: {parsed}") from exc
+            except httpx.TooManyRedirects as exc:
+                raise ToolError(f"more than {max_redirects} redirects: {parsed}") from exc
+            except httpx.HTTPError as exc:
+                raise ToolError(_failure("download failed", rt, exc)) from exc
+            fh.seek(0)
+            try:
+                await asyncio.to_thread(rt.workspace.write_file, target, fh)
+            except (OSError, ToolError) as exc:
+                raise ToolError(f"cannot write to {rt.workspace.rel(target)}: {_reason(exc)}") from exc
         return (
             f"saved {size} bytes to {rt.workspace.rel(target)}\n"
             f"url: {final_url}\ncontent-type: {content_type}\nsha256: {digest.hexdigest()}"

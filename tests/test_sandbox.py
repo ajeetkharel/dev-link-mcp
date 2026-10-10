@@ -246,6 +246,44 @@ async def test_background_job_dies_when_command_returns(sandbox):
 
 
 @needs_proc
+@pytest.mark.parametrize("backend", [pytest.param("auto", marks=pytest.mark.bwrap), "none"])
+async def test_timeout_kills_background_job_after_bash_exited(config, backend):
+    # bash exits at once. Without a PID namespace the job keeps stdout open, so the call only ends
+    # at the timeout; bubblewrap takes the job down with bash and returns at once.
+    config.sandbox.backend = backend
+    sb = Sandbox(config)
+    r = await sh(sb, "sleep 3101 & echo started", timeout_s=1)
+    assert r.timed_out == (backend == "none") and "started" in r.stdout
+    await asyncio.sleep(0.3)
+    assert not _sleepers_alive(("3101",))
+
+
+@needs_proc
+@pytest.mark.parametrize("backend", [pytest.param("auto", marks=pytest.mark.bwrap), "none"])
+async def test_background_job_in_the_group_dies_when_command_returns(config, backend):
+    config.sandbox.backend = backend
+    sb = Sandbox(config)
+    r = await sh(sb, "sleep 3102 </dev/null >/dev/null 2>&1 & echo done")
+    assert r.ok and r.stdout == "done\n"
+    await asyncio.sleep(0.3)
+    assert not _sleepers_alive(("3102",))
+
+
+@needs_proc
+async def test_cancellation_kills_background_job_after_bash_exited(config):
+    config.sandbox.backend = "none"
+    sb = Sandbox(config)
+    task = asyncio.create_task(sh(sb, "sleep 3103 & echo started", timeout_s=60))
+    await asyncio.sleep(0.5)
+    assert _sleepers_alive(("3103",))
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.3)
+    assert not _sleepers_alive(("3103",))
+
+
+@needs_proc
 async def test_cancellation_kills_process(sandbox):
     task = asyncio.create_task(sh(sandbox, "sleep 3040", timeout_s=60))
     await asyncio.sleep(0.5)

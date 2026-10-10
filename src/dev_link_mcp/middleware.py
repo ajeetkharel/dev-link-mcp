@@ -13,6 +13,9 @@ from dev_link_mcp.audit import AuditStore
 _CLIENT_INFO_META = "io.modelcontextprotocol/clientInfo"
 # Handshake requests: `initialize` on 2025-era protocols, `server/discover` on 2026-07-28+.
 _HANDSHAKES = ("initialize", "server/discover")
+# Sessions whose client label is remembered. Sessions are never announced as closed, so the map
+# is capped; an evicted session's calls fall back to the user-agent header.
+_MAX_CLIENTS = 1000
 
 
 def _client_label(info: Any) -> str | None:
@@ -78,7 +81,11 @@ class AuditMiddleware:
                 # The session id is minted during initialize and only appears on later requests.
                 session = getattr(ctx.session, "session_id", None)
             if session and client:
+                # Re-inserted so the dict's order is oldest handshake first.
+                self._clients.pop(session, None)
                 self._clients[session] = client
+                if len(self._clients) > _MAX_CLIENTS:
+                    del self._clients[next(iter(self._clients))]
             params.pop("_meta", None)
             self.audit.record(
                 "session", ctx.method, params, session=session, client=client, result=f"protocol {ctx.protocol_version}"

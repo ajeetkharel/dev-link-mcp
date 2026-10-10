@@ -7,6 +7,7 @@ installing a package never adds tools by itself.
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 import importlib
 import importlib.metadata
@@ -93,12 +94,18 @@ class Toolset:
     disabled: list[str] = field(default_factory=list)
 
     async def shutdown(self) -> None:
-        """Await shutdown() of every registered group. A failure is logged and the others still run."""
-        for name, group in self.groups.items():
+        """Await shutdown() of every registered group, all at once. A failure is logged and the
+        others still run."""
+
+        async def one(name: str, group: ToolGroup) -> None:
             try:
                 await group.shutdown()
             except Exception:
                 log.exception("shutdown of tool group %s failed", name)
+
+        # Concurrently, so slow groups (docker stopping containers, the browser) share the few
+        # seconds `dev-link stop` allows before SIGKILL instead of adding up.
+        await asyncio.gather(*(one(name, group) for name, group in self.groups.items()))
 
 
 def missing_requirements(builtin: Builtin) -> list[str]:

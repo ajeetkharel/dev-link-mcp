@@ -108,6 +108,23 @@ def test_result_clipping(store):
     assert len(event["result"]) < 1100
 
 
+def test_args_clipped_like_results(store):
+    # A large tool argument (file content, process input) must not grow the store without bound.
+    event_id = store.record("tool", "process_input", {"text": "y" * 5000})
+    event = store.get(event_id)
+    assert isinstance(event["args"], str)
+    assert event["args"].startswith('{"text": "' + "y" * 990)
+    assert "clipped in audit log, 5012 bytes total" in event["args"]
+    assert len(event["args"]) < 1100
+    assert len(_jsonl(store)[-1]["args"]) < 1100
+    assert store.detail(event_id)["args_size"] < 1100
+
+
+def test_small_args_stay_json(store):
+    event = store.get(store.record("tool", "read_file", {"path": "a.txt"}))
+    assert event["args"] == {"path": "a.txt"}
+
+
 def test_result_bytes_counts_utf8(store):
     event = store.get(store.record("tool", "uni", result="é" * 10))
     assert event["result_bytes"] == 20
@@ -353,6 +370,30 @@ def test_failed_jsonl_rewrite_keeps_the_store_usable(store, monkeypatch):
     after = store.record("tool", "after")
     assert [json.loads(line)["id"] for line in store.jsonl_path.read_text().splitlines()][-1] == after
     assert not [p for p in store.db_path.parent.iterdir() if p.name.endswith(".tmp")]
+
+
+def test_failed_jsonl_open_closes_the_temp_file(store, monkeypatch):
+    _record_old(store, monkeypatch, "old")
+    real_open = type(store.jsonl_path).open
+    calls = {"rb": 0}
+
+    def open_failing_second_read(self, mode="r", *args, **kwargs):
+        if self == store.jsonl_path and mode == "rb":
+            calls["rb"] += 1
+            if calls["rb"] == 2:
+                raise OSError("source vanished")
+        return real_open(self, mode, *args, **kwargs)
+
+    fds_before = set(os.listdir("/proc/self/fd"))
+    monkeypatch.setattr(type(store.jsonl_path), "open", open_failing_second_read)
+    with pytest.raises(OSError, match="source vanished"):
+        store.prune(30, store.db_path.parent / "processes")
+    monkeypatch.undo()
+    # The reopened append handle replaces the closed one, so the count matches; a leak adds one.
+    assert len(set(os.listdir("/proc/self/fd"))) <= len(fds_before)
+    assert not [p for p in store.db_path.parent.iterdir() if p.name.endswith(".tmp")]
+    after = store.record("tool", "after")
+    assert [json.loads(line)["id"] for line in store.jsonl_path.read_text().splitlines()][-1] == after
 
 
 def test_prune_vacuums_after_deleting(store, monkeypatch):

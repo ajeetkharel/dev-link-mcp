@@ -5,16 +5,18 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from importlib import resources
 from importlib.resources.abc import Traversable
-from typing import Any
+from typing import Any, BinaryIO
+from urllib.parse import quote
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecurityMiddleware, TransportSecuritySettings
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from starlette.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 
 from dev_link_mcp.audit import SLICE_DEFAULT, SLICE_FIELDS
 from dev_link_mcp.browse import TEXT_DEFAULT, BrowseError, FileBrowser
@@ -74,6 +76,15 @@ def _int(request: Request, name: str, default: int | None = None) -> int | None:
         return int(raw)
     except ValueError:
         return default
+
+
+async def _chunks(fh: BinaryIO, size: int = 1 << 16) -> AsyncIterator[bytes]:
+    """Read `fh` in chunks off the event loop, closing it when done or when the client goes away."""
+    try:
+        while chunk := await asyncio.to_thread(fh.read, size):
+            yield chunk
+    finally:
+        fh.close()
 
 
 def _error(status: int, message: str) -> JSONResponse:
@@ -338,8 +349,12 @@ def add_dashboard_routes(mcp: MCPServer, rt: Runtime, toolset: Toolset) -> None:
         }
         try:
             if request.query_params.get("download") == "1":
-                path = await asyncio.to_thread(browser.regular_file, raw)
-                return FileResponse(path, media_type="application/octet-stream", filename=path.name, headers=headers)
+                # Streamed from a handle opened without following symlinks; FileResponse would reopen
+                # the path, which the agent may have swapped since the check.
+                fh, name = await asyncio.to_thread(browser.open_download, raw)
+                headers["Content-Length"] = str(os.fstat(fh.fileno()).st_size)
+                headers["Content-Disposition"] = f"attachment; filename*=utf-8''{quote(name)}"
+                return StreamingResponse(_chunks(fh), media_type="application/octet-stream", headers=headers)
             offset = _int(request, "offset", 0) or 0
             limit = _int(request, "limit", TEXT_DEFAULT) or TEXT_DEFAULT
             chunk = await asyncio.to_thread(browser.read, raw, offset, limit)

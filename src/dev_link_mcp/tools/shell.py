@@ -83,8 +83,8 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
     ) -> str:
         """Run a shell command and wait for it to finish. Returns the exit code, duration, stdout
         and stderr; a non-zero exit is reported in the text, not as a tool error. Use start_process
-        for servers, watchers and anything long-running: in the sandbox, background jobs (`cmd &`,
-        nohup) are killed when the command returns. Sandboxed commands share a /tmp (emptied when
+        for servers, watchers and anything long-running: background jobs (`cmd &`, nohup) are
+        killed when the command returns. Sandboxed commands share a /tmp (emptied when
         the server starts) and a private HOME, both kept between calls."""
         if not command.strip():
             raise ToolError("command is empty")

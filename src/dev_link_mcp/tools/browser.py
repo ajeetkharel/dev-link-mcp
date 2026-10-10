@@ -125,6 +125,10 @@ class _BrowserHost:
         self.idle_closing = False
         # Ids of pages closed by the idle timeout, oldest first, so a late call gets a clear error.
         self.idle_closed: dict[str, None] = {}
+        # browser_open calls past the page limit check that have not registered their page yet.
+        self.opening = 0
+        # Closes started from Playwright event handlers; kept here so they are not garbage collected.
+        self.tasks: set[asyncio.Task[None]] = set()
 
     def tracked(self, fn: Callable[P, Awaitable[T]]) -> Callable[P, Coroutine[Any, Any, T]]:
         """Wrap a browser tool so it counts as browser use for the idle timeout."""
@@ -198,6 +202,8 @@ class _BrowserHost:
             self.active = 0
             self.idle_task = None
             self.idle_closing = False
+            self.opening = 0
+            self.tasks.clear()
         assert self.lock is not None
         return self.lock
 
@@ -244,7 +250,8 @@ class _BrowserHost:
         page_id = page_id.strip()
         state = self.pages.get(page_id)
         if state is None or state.page.is_closed():
-            self.pages.pop(page_id, None)
+            if state is not None:
+                self.forget(state)
             if page_id in self.idle_closed:
                 raise ToolError(
                     f"page {page_id} was closed after {self.idle_timeout_s:g} s without browser use;"
@@ -254,8 +261,36 @@ class _BrowserHost:
             raise ToolError(f"no open page with id {page_id!r} (open pages: {known}). Use browser_open first.")
         return state
 
+    def live_pages(self) -> list[_PageState]:
+        return [s for s in self.pages.values() if not s.page.is_closed()]
+
+    def spawn(self, close: Awaitable[None]) -> None:
+        """Run a close from a synchronous Playwright event handler, ignoring its errors."""
+
+        async def run() -> None:
+            # The page or context may already be gone with a crashed or closed browser.
+            with contextlib.suppress(Exception):
+                await close
+
+        task = asyncio.create_task(run())
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+
+    def forget(self, state: _PageState) -> None:
+        """Stop tracking a page that is closed or closing. When it was the last tracked page of its
+        context, close the context in the background so its cookies, storage and memory go too.
+        Does nothing for a page that is no longer tracked."""
+        if self.pages.get(state.id) is not state:
+            return
+        del self.pages[state.id]
+        if not any(s.context is state.context for s in self.pages.values()):
+            self.spawn(state.context.close())
+
     async def close_page(self, state: _PageState) -> None:
-        self.pages.pop(state.id, None)
+        """Close the page's whole context: the page and every popup sharing it stop being tracked."""
+        for other in list(self.pages.values()):
+            if other.context is state.context:
+                del self.pages[other.id]
         # The context may already be gone with a crashed browser.
         with contextlib.suppress(Exception):
             await state.context.close()
@@ -282,6 +317,8 @@ class _BrowserHost:
     async def _close_all(self) -> None:
         for state in list(self.pages.values()):
             await self.close_page(state)
+        if self.tasks:
+            await asyncio.wait(set(self.tasks))
         if self.browser is not None:
             with contextlib.suppress(Exception):
                 await self.browser.close()
@@ -399,8 +436,9 @@ def _track(host: _BrowserHost, state: _PageState) -> None:
     page.on("requestfailed", lambda request: finish(request, request.failure or "failed"))
 
     def on_close(_page: Any) -> None:
-        if host.pages.get(state.id) is state:
-            del host.pages[state.id]
+        # Covers pages that close themselves with window.close(), which would otherwise keep
+        # their context open until browser_close or the idle timeout.
+        host.forget(state)
 
     page.on("close", on_close)
 
@@ -427,6 +465,20 @@ async def _new_context(
         # refuses connections backs them up for everything except loopback.
         options["proxy"] = {"server": host.sink_proxy(), "bypass": "localhost,*.localhost,127.0.0.0/8,[::1]"}
     context = await browser.new_context(**options)
+    try:
+        await _guard_context(rt, context, default_timeout_s)
+    except BaseException:
+        await asyncio.shield(_close_quietly(context))
+        raise
+    return context
+
+
+async def _close_quietly(context: BrowserContext) -> None:
+    with contextlib.suppress(Exception):
+        await context.close()
+
+
+async def _guard_context(rt: Runtime, context: BrowserContext, default_timeout_s: float) -> None:
     context.set_default_timeout(default_timeout_s * 1000)
     if not rt.config.sandbox.network:
         # Requests the route sees fail with a clear blockedbyclient error instead of a proxy error.
@@ -442,7 +494,6 @@ async def _new_context(
 
         await context.route(denied, block)
         await context.route_web_socket(denied, block_ws)
-    return context
 
 
 async def _title(page: Page) -> str:
@@ -634,24 +685,41 @@ def _register(mcp: MCPServer, rt: Runtime, settings: BrowserSettings, host: _Bro
     default_timeout_s = settings.default_timeout_s
     limit = rt.config.limits.max_output_bytes
 
+    def full() -> bool:
+        return len(host.live_pages()) + host.opening >= max_pages
+
     async def open_page(url: str, width: int, height: int, device: str | None) -> _PageState:
         await host.ensure_browser()
-        live = [s for s in host.pages.values() if not s.page.is_closed()]
-        if len(live) >= max_pages:
-            raise ToolError(f"{max_pages} pages are already open ({', '.join(s.id for s in live)}); close one first.")
-        context = await _new_context(
-            rt, host, width=width, height=height, device=device, default_timeout_s=default_timeout_s
-        )
+        if full():
+            live = ", ".join(s.id for s in host.live_pages())
+            raise ToolError(f"{max_pages} pages are already open ({live}); close one first.")
+        # Reserve the slot before the first await so concurrent opens cannot all pass the check.
+        host.opening += 1
         try:
-            page = await context.new_page()
-        except Exception as exc:
-            await context.close()
-            raise _playwright_error("opening a page", exc) from exc
-        state = _register_page(host, page, context)
+            context = await _new_context(
+                rt, host, width=width, height=height, device=device, default_timeout_s=default_timeout_s
+            )
+            try:
+                page = await context.new_page()
+            except Exception as exc:
+                await _close_quietly(context)
+                raise _playwright_error("opening a page", exc) from exc
+            except BaseException:
+                await asyncio.shield(_close_quietly(context))
+                raise
+            state = _register_page(host, page, context)
+        finally:
+            host.opening -= 1
 
-        # Popups (target=_blank, window.open) become addressable pages too.
+        # Popups (target=_blank, window.open) become addressable pages too, within the page limit.
         def on_popup(popup: Page) -> None:
-            _register_page(host, popup, context, popup=True)
+            if not full():
+                _register_page(host, popup, context, popup=True)
+                return
+            # A script calling window.open() in a loop would otherwise start renderers without bound.
+            host.spawn(popup.close())
+            message = f"a popup was closed because {max_pages} pages are already open; close one first"
+            state.console.append({"seq": state.next_seq(), "type": "error", "text": message, "location": ""})
 
         context.on("page", on_popup)
         return state
@@ -678,10 +746,11 @@ def _register(mcp: MCPServer, rt: Runtime, settings: BrowserSettings, host: _Bro
         state = await open_page(url, width, height, device)
         try:
             status = await _goto(rt, state, url, wait_until, timeout_s) if url != "about:blank" else None
-        except ToolError:
-            await host.close_page(state)
+            return await _page_summary(host, state, 0, status=status)
+        except BaseException:
+            # Shielded so a cancelled call still frees the page and its slot under max_pages.
+            await asyncio.shield(host.close_page(state))
             raise
-        return await _page_summary(host, state, 0, status=status)
 
     @mcp.tool(annotations=_OPEN_WORLD_WRITE)
     @host.tracked
@@ -868,9 +937,9 @@ def _register(mcp: MCPServer, rt: Runtime, settings: BrowserSettings, host: _Bro
             page_url = state.page.url
         finally:
             if temp is not None:
-                await host.close_page(temp)
+                await asyncio.shield(host.close_page(temp))
         path = rt.workspace.artifact_path(name, ".png")
-        await asyncio.to_thread(path.write_bytes, png)
+        await asyncio.to_thread(rt.workspace.write_file, path, png)
         where = f"page {state.id}" if temp is None else page_url
         line = f"screenshot of {where} saved to {rt.workspace.rel(path)} ({len(png)} bytes)"
         if len(png) > MAX_INLINE_IMAGE_BYTES:
@@ -981,7 +1050,7 @@ def _register(mcp: MCPServer, rt: Runtime, settings: BrowserSettings, host: _Bro
         pages = []
         for state in list(host.pages.values()):
             if state.page.is_closed():
-                host.pages.pop(state.id, None)
+                host.forget(state)
                 continue
             pages.append(
                 {
@@ -1001,13 +1070,11 @@ def _register(mcp: MCPServer, rt: Runtime, settings: BrowserSettings, host: _Bro
         cookies and storage and closes the popups it opened; closing a popup closes only that popup."""
         state = host.get(page_id)
         if state.popup:
-            host.pages.pop(state.id, None)
+            host.forget(state)
             with contextlib.suppress(Exception):
                 await state.page.close()
             return f"closed {state.id}"
         siblings = [s for s in list(host.pages.values()) if s.context is state.context]
-        for sibling in siblings:
-            host.pages.pop(sibling.id, None)
         await host.close_page(state)
         return f"closed {', '.join(s.id for s in siblings)}"
 

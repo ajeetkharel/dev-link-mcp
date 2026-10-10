@@ -6,17 +6,17 @@ import asyncio
 import base64
 import contextlib
 import difflib
+import errno
 import mimetypes
 import os
 import shlex
 import shutil
 import stat
-import tempfile
 import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Any, TypeVar
+from typing import Annotated, Any, BinaryIO, TypeVar
 
 import mcp.types as types
 from mcp.server.mcpserver import MCPServer
@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 from dev_link_mcp.runtime import Runtime
 from dev_link_mcp.tools.base import ToolGroup
 from dev_link_mcp.tools.common import DESTRUCTIVE, READ_ONLY, WRITE, clip
+from dev_link_mcp.workspace import read_at_most
 
 _IMAGE_TYPES = {
     ".png": "image/png",
@@ -93,9 +94,11 @@ def _is_binary(sample: bytes) -> bool:
     return False
 
 
-def _sniff(path: Path) -> bytes:
-    with path.open("rb") as f:
-        return f.read(_SNIFF_BYTES)
+def _sniff(f: BinaryIO) -> bytes:
+    """First bytes of an open file, leaving it positioned at the start."""
+    sample = f.read(_SNIFF_BYTES)
+    f.seek(0)
+    return sample
 
 
 def _human(size: int) -> str:
@@ -107,8 +110,8 @@ def _human(size: int) -> str:
     return f"{size}B"
 
 
-def _numbered_lines(path: Path, offset: int, limit: int, budget: int) -> tuple[list[str], int, int, bool]:
-    """Read lines [offset, offset+limit) of a text file in `cat -n` style.
+def _numbered_lines(f: BinaryIO, offset: int, limit: int, budget: int) -> tuple[list[str], int, int, bool]:
+    """Read lines [offset, offset+limit) of an open text file in `cat -n` style.
 
     Returns (formatted lines, last line shown, total line count, budget_hit). Stops adding
     lines once their size would pass `budget` characters, but still counts the whole file.
@@ -119,32 +122,31 @@ def _numbered_lines(path: Path, offset: int, limit: int, budget: int) -> tuple[l
     last = offset - 1
     budget_hit = False
     in_long_line = False
-    with path.open("rb") as f:
-        for piece in iter(lambda: f.readline(_READ_CHUNK), b""):
-            if in_long_line:
-                in_long_line = not piece.endswith(b"\n")
-                continue
-            total += 1
-            # A short piece without a newline is the last line of the file, not a cut one.
-            in_long_line = len(piece) == _READ_CHUNK and not piece.endswith(b"\n")
-            if total < offset or total >= offset + limit or budget_hit:
-                continue
-            line = piece.decode("utf-8", errors="replace").removesuffix("\n").removesuffix("\r")
-            if len(line) > _MAX_LINE_CHARS or in_long_line:
-                line = line[:_MAX_LINE_CHARS] + " ... [line truncated]"
-            entry = f"{total:>6}\t{line}"
-            if out and used + len(entry) + 1 > budget:
-                budget_hit = True
-                continue
-            out.append(entry)
-            used += len(entry) + 1
-            last = total
+    for piece in iter(lambda: f.readline(_READ_CHUNK), b""):
+        if in_long_line:
+            in_long_line = not piece.endswith(b"\n")
+            continue
+        total += 1
+        # A short piece without a newline is the last line of the file, not a cut one.
+        in_long_line = len(piece) == _READ_CHUNK and not piece.endswith(b"\n")
+        if total < offset or total >= offset + limit or budget_hit:
+            continue
+        line = piece.decode("utf-8", errors="replace").removesuffix("\n").removesuffix("\r")
+        if len(line) > _MAX_LINE_CHARS or in_long_line:
+            line = line[:_MAX_LINE_CHARS] + " ... [line truncated]"
+        entry = f"{total:>6}\t{line}"
+        if out and used + len(entry) + 1 > budget:
+            budget_hit = True
+            continue
+        out.append(entry)
+        used += len(entry) + 1
+        last = total
     return out, last, total, budget_hit
 
 
-def _render_text(rel: str, path: Path, offset: int, limit: int, budget: int) -> str:
-    """Numbered view of a text file with a header and continuation hints."""
-    lines, last, total, budget_hit = _numbered_lines(path, offset, limit, budget)
+def _render_text(rel: str, f: BinaryIO, offset: int, limit: int, budget: int) -> str:
+    """Numbered view of an open text file with a header and continuation hints."""
+    lines, last, total, budget_hit = _numbered_lines(f, offset, limit, budget)
     if total == 0:
         return f"{rel}: (empty file)"
     if offset > total:
@@ -157,36 +159,59 @@ def _render_text(rel: str, path: Path, offset: int, limit: int, budget: int) -> 
     return "\n".join(parts)
 
 
-def _read_text(path: Path, rel: str) -> str:
-    """Whole file as UTF-8 with line endings preserved. Raises ToolError for binary files."""
+def _read_text(f: BinaryIO, rel: str) -> str:
+    """Whole open file as UTF-8 with line endings preserved. Raises ToolError for binary files."""
     try:
-        with path.open("r", encoding="utf-8", newline="") as f:
-            return f.read()
+        return f.read().decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ToolError(f"{rel} is not UTF-8 text; it cannot be edited as text") from exc
 
 
-def _write_text(path: Path, content: str) -> None:
-    """Write UTF-8 text without newline translation, replacing existing files atomically.
+# Flags for opening directories and files below an already pinned directory descriptor.
+_DIR_READ = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+_FILE_READ = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+_FILE_CREATE = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 
-    Existing files keep their permission bits. The temp file lives in the same directory so
-    os.replace is a rename on one filesystem.
+
+def _copy_entry(src_dir: int, name: str, dst_dir: int, new_name: str) -> None:
+    """Copy `name` in `src_dir` to `new_name` in `dst_dir`, recursing into directories.
+
+    Works only on directory descriptors and never follows a symlink: links are copied as links,
+    so neither side can be redirected outside while the copy runs. Permission bits and
+    timestamps of files and directories are kept. Raises ToolError for FIFOs, sockets and
+    devices; OSError for other failures (the copy may then be partial).
     """
-    if not path.exists():
-        with path.open("x", encoding="utf-8", newline="") as f:
-            f.write(content)
+    st = os.stat(name, dir_fd=src_dir, follow_symlinks=False)
+    if stat.S_ISLNK(st.st_mode):
+        os.symlink(os.readlink(name, dir_fd=src_dir), new_name, dir_fd=dst_dir)
         return
-    mode = stat.S_IMODE(path.stat().st_mode)
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
-            f.write(content)
-        os.chmod(tmp, mode)
-        os.replace(tmp, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp)
-        raise
+    if stat.S_ISDIR(st.st_mode):
+        os.mkdir(new_name, 0o700, dir_fd=dst_dir)
+        source = os.open(name, _DIR_READ, dir_fd=src_dir)
+        try:
+            target = os.open(new_name, _DIR_READ, dir_fd=dst_dir)
+            try:
+                with os.scandir(source) as it:
+                    names = [entry.name for entry in it]
+                for child in names:
+                    _copy_entry(source, child, target, child)
+                os.chmod(target, stat.S_IMODE(st.st_mode))
+                os.utime(target, ns=(st.st_atime_ns, st.st_mtime_ns))
+            finally:
+                os.close(target)
+        finally:
+            os.close(source)
+        return
+    if not stat.S_ISREG(st.st_mode):
+        raise ToolError(f"cannot copy {name}: not a regular file, directory or symlink")
+    with os.fdopen(os.open(name, _FILE_READ, dir_fd=src_dir), "rb") as src:
+        if not stat.S_ISREG(os.fstat(src.fileno()).st_mode):
+            raise ToolError(f"cannot copy {name}: not a regular file")
+        with os.fdopen(os.open(new_name, _FILE_CREATE, 0o600, dir_fd=dst_dir), "wb") as dst:
+            shutil.copyfileobj(src, dst)
+            os.chmod(dst.fileno(), stat.S_IMODE(st.st_mode))
+            dst.flush()
+            os.utime(dst.fileno(), ns=(st.st_atime_ns, st.st_mtime_ns))
 
 
 def _diff(rel: str, before: str, after: str) -> str:
@@ -335,9 +360,19 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
 
     def read_one(path: str, offset: int, limit: int, budget: int) -> str:
         target, rel = require_file(path)
-        if _is_binary(_sniff(target)):
-            raise ToolError(f"{rel} is a binary file ({_human(target.stat().st_size)}); use file_info to inspect it")
-        return _render_text(rel, target, offset, limit, budget)
+        with ws.open_file(target) as f:
+            if _is_binary(_sniff(f)):
+                size = _human(os.fstat(f.fileno()).st_size)
+                raise ToolError(f"{rel} is a binary file ({size}); use file_info to inspect it")
+            return _render_text(rel, f, offset, limit, budget)
+
+    def read_image(target: Path, rel: str) -> bytes:
+        with ws.open_file(target) as f:
+            size = os.fstat(f.fileno()).st_size
+            data = None if size > limits.max_read_bytes else read_at_most(f, limits.max_read_bytes)
+            if data is None:
+                raise ToolError(f"{rel} is {_human(size)}, over the {_human(limits.max_read_bytes)} read limit")
+            return data
 
     @mcp.tool(annotations=READ_ONLY)
     async def read_file(
@@ -352,10 +387,7 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
         target, rel = await in_thread(require_file, path)
         mime = _IMAGE_TYPES.get(target.suffix.lower())
         if mime:
-            size = target.stat().st_size
-            if size > limits.max_read_bytes:
-                raise ToolError(f"{rel} is {_human(size)}, over the {_human(limits.max_read_bytes)} read limit")
-            data = await in_thread(target.read_bytes)
+            data = await in_thread(read_image, target, rel)
             return types.ImageContent(type="image", data=base64.b64encode(data).decode(), mime_type=mime)
         return await in_thread(read_one, path, offset, limit, limits.max_output_bytes)
 
@@ -408,10 +440,9 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
             if not target.parent.is_dir():
                 if not create_dirs:
                     raise ToolError(f"parent directory of {rel} does not exist; set create_dirs=true")
-                target.parent.mkdir(parents=True, exist_ok=True)
+                ws.make_dirs(target.parent)
             with write_lock:
-                existed = target.exists()
-                _write_text(target, content)
+                existed = ws.write_file(target, content.encode("utf-8"))
             size = len(content.encode("utf-8"))
             line_count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
             return f"{'overwrote' if existed else 'created'} {rel} ({size} bytes, {line_count} lines)"
@@ -421,14 +452,15 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
     def edit(path: str, edits: list[EditSpec]) -> str:
         target, rel = require_file(path)
         with write_lock:
-            before = _read_text(target, rel)
+            with ws.open_file(target) as f:
+                before = _read_text(f, rel)
             after = before
             total = 0
             for index, spec in enumerate(edits, 1):
                 label = f"edit {index}" if len(edits) > 1 else "edit"
                 after, count = _replace(after, spec.old_string, spec.new_string, spec.replace_all, label)
                 total += count
-            _write_text(target, after)
+            ws.write_file(target, after.encode("utf-8"))
         noun = "replacement" if total == 1 else "replacements"
         return f"edited {rel}: {total} {noun}\n{_diff(rel, before, after)}"
 
@@ -501,23 +533,25 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
             rel = ws.rel(target)
             if not target.is_dir():
                 raise ToolError(f"{rel} is not a directory; use file_info or read_file")
-            entries = sorted(os.scandir(target), key=lambda e: (not e.is_dir(), e.name.lower()))
             hidden = 0
             rows: list[str] = []
-            for entry in entries:
-                if entry.name.startswith(".") and not show_hidden:
-                    hidden += 1
-                    continue
-                if entry.is_symlink():
-                    rows.append(f"link {'':>8} {entry.name} -> {os.readlink(entry.path)}")
-                elif entry.is_dir():
-                    rows.append(f"dir  {'':>8} {entry.name}/")
-                else:
-                    try:
-                        size = _human(entry.stat().st_size)
-                    except OSError:
-                        size = "?"
-                    rows.append(f"file {size:>8} {entry.name}")
+            with ws.open_dir(target) as fd:
+                with os.scandir(fd) as it:
+                    entries = sorted(it, key=lambda e: (not e.is_dir(), e.name.lower()))
+                for entry in entries:
+                    if entry.name.startswith(".") and not show_hidden:
+                        hidden += 1
+                        continue
+                    if entry.is_symlink():
+                        rows.append(f"link {'':>8} {entry.name} -> {os.readlink(entry.name, dir_fd=fd)}")
+                    elif entry.is_dir():
+                        rows.append(f"dir  {'':>8} {entry.name}/")
+                    else:
+                        try:
+                            size = _human(entry.stat().st_size)
+                        except OSError:
+                            size = "?"
+                        rows.append(f"file {size:>8} {entry.name}")
             summary = f"{rel}: {len(rows)} entries"
             if hidden:
                 summary += f" ({hidden} hidden; set show_hidden=true to see them)"
@@ -543,10 +577,12 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
             count = 0
             truncated = False
 
-            def walk(directory: Path, depth: int) -> None:
+            def walk(fd: int, directory: Path, depth: int) -> None:
+                """List `directory` through its open descriptor; children are opened without following links."""
                 nonlocal count, truncated
                 try:
-                    entries = sorted(os.scandir(directory), key=lambda e: (not e.is_dir(), e.name.lower()))
+                    with os.scandir(fd) as it:
+                        entries = sorted(it, key=lambda e: (not e.is_dir(), e.name.lower()))
                 except OSError as exc:
                     lines.append(f"{'  ' * depth}(unreadable: {exc.strerror})")
                     return
@@ -557,21 +593,30 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
                     count += 1
                     indent = "  " * depth
                     if entry.is_symlink():
-                        lines.append(f"{indent}{entry.name} -> {os.readlink(entry.path)}")
+                        lines.append(f"{indent}{entry.name} -> {os.readlink(entry.name, dir_fd=fd)}")
                     elif entry.is_dir():
-                        if entry.name in _TREE_SKIP or Path(entry.path) == worktrees:
+                        if entry.name in _TREE_SKIP or directory / entry.name == worktrees:
                             lines.append(f"{indent}{entry.name}/ (skipped)")
                         elif depth >= max_depth:
                             lines.append(f"{indent}{entry.name}/ ...")
                         else:
                             lines.append(f"{indent}{entry.name}/")
-                            walk(Path(entry.path), depth + 1)
+                            try:
+                                child = os.open(entry.name, _DIR_READ, dir_fd=fd)
+                            except OSError as exc:
+                                lines.append(f"{indent}  (unreadable: {exc.strerror})")
+                                continue
+                            try:
+                                walk(child, directory / entry.name, depth + 1)
+                            finally:
+                                os.close(child)
                             if truncated:
                                 return
                     else:
                         lines.append(f"{indent}{entry.name}")
 
-            walk(target, 1)
+            with ws.open_dir(target) as top:
+                walk(top, target, 1)
             if truncated:
                 lines.append(f"(stopped at {max_entries} entries; narrow the path or raise max_entries)")
             return clip("\n".join(lines), limits.max_output_bytes)
@@ -588,25 +633,38 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
 
         def run() -> dict[str, Any]:
             link = entry_path(path)
-            link_target = os.readlink(link) if link.is_symlink() else None
+            link_target = None
+            if link != ws.root and link.is_symlink():
+                with ws.dir_fd(link.parent) as parent:
+                    link_target = os.readlink(link.name, dir_fd=parent)
             target = ws.resolve(path, must_exist=True)
-            st = target.stat()
+            extra: dict[str, Any] = {}
+            if target.is_dir():
+                with ws.open_dir(target) as fd:
+                    st = os.fstat(fd)
+                    with os.scandir(fd) as it:
+                        extra["entries"] = sum(1 for _ in it)
+            elif target.is_file():
+                with ws.open_file(target) as f:
+                    st = os.fstat(f.fileno())
+                    extra["mime_type"] = mimetypes.guess_type(target.name)[0]
+                    extra["binary"] = _is_binary(_sniff(f))
+                    if not extra["binary"] and st.st_size <= limits.max_read_bytes:
+                        _, _, extra["lines"], _ = _numbered_lines(f, 1, 1, 0)
+            else:
+                with ws.dir_fd(target.parent) as parent:
+                    st = os.stat(target.name, dir_fd=parent, follow_symlinks=False)
+            kind = "directory" if stat.S_ISDIR(st.st_mode) else "file" if stat.S_ISREG(st.st_mode) else "other"
             info: dict[str, Any] = {
                 "path": ws.rel(target),
-                "type": "directory" if target.is_dir() else "file" if target.is_file() else "other",
+                "type": kind,
                 "size": st.st_size,
                 "modified": datetime.fromtimestamp(st.st_mtime, UTC).isoformat(timespec="seconds"),
                 "mode": oct(stat.S_IMODE(st.st_mode)),
             }
             if link_target is not None:
                 info["symlink"] = {"path": ws.rel(link), "target": link_target}
-            if target.is_dir():
-                info["entries"] = sum(1 for _ in os.scandir(target))
-            elif target.is_file():
-                info["mime_type"] = mimetypes.guess_type(target.name)[0]
-                info["binary"] = _is_binary(_sniff(target))
-                if not info["binary"] and st.st_size <= limits.max_read_bytes:
-                    _, _, info["lines"], _ = _numbered_lines(target, 1, 1, 0)
+            info.update(extra)
             return info
 
         return await in_thread(run)
@@ -624,7 +682,7 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
                 raise ToolError(f"{rel} exists and is not a directory")
             if target.is_dir():
                 return f"{rel} already exists"
-            target.mkdir(parents=True)
+            ws.make_dirs(target)
             return f"created {rel}/"
 
         return await in_thread(run)
@@ -638,14 +696,18 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
             raise ToolError(f"cannot put {ws.rel(src)} inside itself ({rel})")
         if src.is_relative_to(dst):
             raise ToolError(f"{rel} contains the source {ws.rel(src)}; replacing it would destroy the source")
-        if dst.exists() or dst.is_symlink():
+        ws.make_dirs(dst.parent)
+        with ws.dir_fd(dst.parent) as parent:
+            try:
+                st = os.stat(dst.name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                return
             if not overwrite:
                 raise ToolError(f"{rel} already exists; set overwrite=true to replace it")
-            if dst.is_dir() and not dst.is_symlink():
-                shutil.rmtree(dst)
+            if stat.S_ISDIR(st.st_mode):
+                shutil.rmtree(dst.name, dir_fd=parent)
             else:
-                dst.unlink()
-        dst.parent.mkdir(parents=True, exist_ok=True)
+                os.unlink(dst.name, dir_fd=parent)
 
     @mcp.tool(annotations=DESTRUCTIVE)
     async def move_path(
@@ -667,7 +729,18 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
             if target == source:
                 raise ToolError("source and destination are the same path")
             prepare_destination(source, target, overwrite)
-            shutil.move(source, target)
+            with ws.dir_fd(source.parent) as src_dir, ws.dir_fd(target.parent) as dst_dir:
+                try:
+                    os.rename(source.name, target.name, src_dir_fd=src_dir, dst_dir_fd=dst_dir)
+                except OSError as exc:
+                    if exc.errno != errno.EXDEV:
+                        raise
+                    # A mount inside the workspace: copy, then remove the original like `mv` does.
+                    _copy_entry(src_dir, source.name, dst_dir, target.name)
+                    if stat.S_ISDIR(os.stat(source.name, dir_fd=src_dir, follow_symlinks=False).st_mode):
+                        shutil.rmtree(source.name, dir_fd=src_dir)
+                    else:
+                        os.unlink(source.name, dir_fd=src_dir)
             return f"moved {ws.rel(source)} -> {ws.rel(target)}"
 
         return await in_thread(run)
@@ -688,11 +761,9 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
             if target == source:
                 raise ToolError("source and destination are the same path")
             prepare_destination(source, target, overwrite)
-            if source.is_dir():
-                # symlinks=True keeps links as links; following them could copy files from outside the workspace.
-                shutil.copytree(source, target, symlinks=True)
-            else:
-                shutil.copy2(source, target)
+            # Links inside a copied directory stay links; following them could copy files from outside.
+            with ws.dir_fd(source.parent) as src_dir, ws.dir_fd(target.parent) as dst_dir:
+                _copy_entry(src_dir, source.name, dst_dir, target.name)
             return f"copied {ws.rel(source)} -> {ws.rel(target)}"
 
         return await in_thread(run)
@@ -711,22 +782,24 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
             if target == ws.root:
                 raise ToolError("refusing to delete the workspace root")
             rel = ws.rel(target)
-            if target.is_symlink() or target.is_file():
-                target.unlink()
-                return f"deleted {rel}"
-            if not target.exists():
+            if not target.parent.is_dir():
                 raise ToolError(f"path does not exist: {rel}")
-            if target.is_dir():
+            with ws.dir_fd(target.parent) as parent:
+                try:
+                    st = os.stat(target.name, dir_fd=parent, follow_symlinks=False)
+                except FileNotFoundError:
+                    raise ToolError(f"path does not exist: {rel}") from None
+                if not stat.S_ISDIR(st.st_mode):
+                    os.unlink(target.name, dir_fd=parent)
+                    return f"deleted {rel}"
                 if recursive:
-                    shutil.rmtree(target)
+                    shutil.rmtree(target.name, dir_fd=parent)
                     return f"deleted directory {rel}/ and its contents"
                 try:
-                    target.rmdir()
+                    os.rmdir(target.name, dir_fd=parent)
                 except OSError as exc:
                     raise ToolError(f"{rel}/ is not empty; set recursive=true to delete it and its contents") from exc
                 return f"deleted empty directory {rel}/"
-            target.unlink()
-            return f"deleted {rel}"
 
         return await in_thread(run)
 

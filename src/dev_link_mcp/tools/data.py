@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import csv
+import io
+import os
 import re
 import sqlite3
 import threading
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, BinaryIO
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -73,16 +76,34 @@ def _deny_attach(action: int, *_: Any) -> int:
     return sqlite3.SQLITE_OK
 
 
-def _open_db(path: Path, write: bool) -> sqlite3.Connection:
+def _same_file(path: Path, expected: os.stat_result) -> bool:
+    """Whether `path`, following symlinks as SQLite does, is still `expected`'s file."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    return (st.st_dev, st.st_ino) == (expected.st_dev, expected.st_ino)
+
+
+def _open_db(path: Path, write: bool, expected: os.stat_result | None = None) -> sqlite3.Connection:
     """Open a SQLite file confined to itself: no ATTACH, read-only unless `write`.
 
-    In write mode a missing file is created. Raises ToolError when SQLite cannot open it.
+    In write mode a missing file is created. SQLite opens files by path and resolves symlinks
+    itself, so when `expected` (the file as checked through the workspace) is given, the path
+    must still lead to that file once SQLite has opened it; a directory swapped for a symlink in
+    between makes it lead elsewhere. Raises ToolError when SQLite cannot open it or the path
+    changed.
     """
     mode = "rwc" if write else "ro"
     try:
         conn = sqlite3.connect(f"{path.as_uri()}?mode={mode}", uri=True, timeout=5, check_same_thread=False)
     except sqlite3.Error as exc:
         raise ToolError(f"cannot open database: {exc}") from exc
+    # SQLite opens the main file during connect. Counting descriptors cannot tell which file it
+    # opened, because SQLite reuses a descriptor parked by an earlier connection to the same file.
+    if expected is not None and not _same_file(path, expected):
+        conn.close()
+        raise ToolError(f"cannot open database: {path.name} changed while it was being opened; try again")
     # One bad byte in a TEXT value would otherwise fail the whole query.
     conn.text_factory = lambda raw: raw.decode("utf-8", errors="replace")
     conn.setlimit(sqlite3.SQLITE_LIMIT_ATTACHED, 0)
@@ -122,14 +143,6 @@ def _sql_error(exc: sqlite3.Error, timeout_s: float) -> ToolError:
     if "readonly" in message or "read-only" in message:
         return ToolError(f"{message}; pass write=true to modify the database")
     return ToolError(f"SQLite error: {message}")
-
-
-def _check_text_file(path: Path) -> None:
-    if not path.is_file():
-        raise ToolError(f"not a file: {path.name}")
-    with path.open("rb") as fh:
-        if b"\0" in fh.read(8192):
-            raise ToolError(f"{path.name} looks binary; use file_info to inspect it")
 
 
 def _value_type(value: str) -> str:
@@ -172,9 +185,12 @@ def _parse_delimiter(delimiter: str | None, sample: str, suffix: str) -> str:
         return ","
 
 
-def _csv_preview(path: Path, display: str, rows: int, delimiter: str | None, has_header: bool) -> str:
-    _check_text_file(path)
-    with path.open(encoding="utf-8-sig", errors="replace", newline="") as fh:
+def _csv_preview(path: Path, raw: BinaryIO, display: str, rows: int, delimiter: str | None, has_header: bool) -> str:
+    """Summary of the delimited text in `raw`, the open file at `path` (used for names and the suffix)."""
+    if b"\0" in raw.read(8192):
+        raise ToolError(f"{path.name} looks binary; use file_info to inspect it")
+    raw.seek(0)
+    with io.TextIOWrapper(raw, encoding="utf-8-sig", errors="replace", newline="") as fh:
         sample = fh.read(65536)
         fh.seek(0)
         delim = _parse_delimiter(delimiter, sample, path.suffix.lower())
@@ -248,6 +264,22 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
             raise ToolError(f"parent directory does not exist: {rt.workspace.rel(path.parent)}")
         return path
 
+    def pin_db(path: Path, create: bool) -> os.stat_result | None:
+        """The checked database file for `_open_db`, or None when the workspace is unconfined.
+
+        A missing file is created empty here (SQLite treats that as a new database), so even a
+        new database is created through the workspace's symlink-refusing walk.
+        """
+        ws = rt.workspace
+        if not ws.confined:
+            return None
+        if create:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+            with ws.dir_fd(path.parent) as parent, contextlib.suppress(FileExistsError):
+                os.close(os.open(path.name, flags, 0o644, dir_fd=parent))
+        with ws.open_file(path) as handle:
+            return os.fstat(handle.fileno())
+
     @mcp.tool(annotations=DESTRUCTIVE)
     async def sqlite_query(
         db_path: Annotated[str, Field(description="SQLite database file, relative to the workspace root")],
@@ -272,7 +304,7 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
         timeout = rt.sandbox.clamp_timeout(timeout_s)
 
         def work(stopped: Callable[[], bool]) -> str:
-            conn = _open_db(path, write)
+            conn = _open_db(path, write, pin_db(path, write))
             try:
                 conn.set_progress_handler(stopped, 10_000)
                 cur = conn.execute(sql, params if params is not None else ())
@@ -312,7 +344,7 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
         timeout = rt.sandbox.clamp_timeout(None)
 
         def work(stopped: Callable[[], bool]) -> str:
-            conn = _open_db(path, write=False)
+            conn = _open_db(path, write=False, expected=pin_db(path, create=False))
             try:
                 conn.set_progress_handler(stopped, 10_000)
                 objects = conn.execute(
@@ -392,7 +424,14 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
         a table. Empty, NA, N/A, null, None and NaN count as null. Statistics cover up to the
         first 100000 rows (fewer for very wide files: about 2 million cells)."""
         target = rt.workspace.resolve(path, must_exist=True)
-        report = await asyncio.to_thread(_csv_preview, target, rt.workspace.rel(target), rows, delimiter, has_header)
+        if not target.is_file():
+            raise ToolError(f"not a file: {target.name}")
+
+        def run() -> str:
+            with rt.workspace.open_file(target) as raw:
+                return _csv_preview(target, raw, rt.workspace.rel(target), rows, delimiter, has_header)
+
+        report = await asyncio.to_thread(run)
         return clip(report, limits.max_output_bytes)
 
 

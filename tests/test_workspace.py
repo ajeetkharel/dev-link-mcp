@@ -154,3 +154,77 @@ def test_unconfined_accepts_any_host_path(workspace, tmp_path):
     ws = Workspace(workspace, confined=False)
     assert ws.resolve("/etc/hostname") == Path("/etc/hostname").resolve()
     assert ws.resolve("../outside") == (tmp_path / "outside")
+
+
+def test_descriptor_helpers_refuse_symlinks_below_the_root(ws, workspace, tmp_path):
+    # Paths as `resolve` returned them before a sandboxed process swapped `src` for a symlink.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "a.py").write_text("host")
+    checked = ws.resolve("src/a.py")
+    (workspace / "src").rename(workspace / "src_real")
+    (workspace / "src").symlink_to(outside)
+    with pytest.raises(ToolError, match="src is not a directory, or was replaced by a symlink"):
+        ws.open_file(checked)
+    with pytest.raises(ToolError, match="replaced by a symlink"):
+        ws.write_file(checked, b"agent")
+    with pytest.raises(ToolError, match="replaced by a symlink"):
+        ws.make_dirs(checked.parent / "new")
+    with pytest.raises(ToolError, match="replaced by a symlink"), ws.open_dir(checked.parent):
+        pass
+    assert sorted(p.name for p in outside.iterdir()) == ["a.py"]
+    assert (outside / "a.py").read_text() == "host"
+
+
+def test_open_file_refuses_a_leaf_symlink_and_a_fifo_without_blocking(ws, workspace):
+    (workspace / "link.py").symlink_to(workspace / "src" / "a.py")
+    with pytest.raises(ToolError, match=r"link\.py was replaced by a symlink"):
+        ws.open_file(workspace / "link.py")
+    os.mkfifo(workspace / "pipe")
+    with pytest.raises(ToolError, match="pipe is not a regular file"):
+        ws.open_file(workspace / "pipe")
+
+
+def test_symlinks_inside_the_workspace_still_work_through_resolve(ws, workspace):
+    (workspace / "inner").symlink_to(workspace / "src")
+    with ws.open_file(ws.resolve("inner/a.py")) as f:
+        assert f.read() == b"x"
+    assert ws.write_file(ws.resolve("inner/a.py"), b"y") is True
+    assert (workspace / "src" / "a.py").read_text() == "y"
+
+
+def test_write_file_creates_or_replaces_and_keeps_the_mode(ws, workspace):
+    target = workspace / "src" / "a.py"
+    target.chmod(0o751)
+    assert ws.write_file(target, b"new") is True
+    assert target.read_bytes() == b"new" and (target.stat().st_mode & 0o777) == 0o751
+    assert ws.write_file(workspace / "src" / "b.py", b"b") is False
+    assert (workspace / "src" / "b.py").read_bytes() == b"b"
+    assert sorted(p.name for p in (workspace / "src").iterdir()) == ["a.py", "b.py"]
+    with pytest.raises(ToolError, match="is a directory"):
+        ws.write_file(workspace / "src", b"x")
+
+
+def test_make_dirs_creates_missing_parents(ws, workspace):
+    ws.make_dirs(workspace / "x" / "y" / "z")
+    assert (workspace / "x" / "y" / "z").is_dir()
+    ws.make_dirs(workspace / "x" / "y" / "z")
+
+
+def test_unconfined_descriptor_helpers_follow_symlinks(workspace, tmp_path):
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "f.txt").write_text("host")
+    (workspace / "link").symlink_to(outside)
+    ws = Workspace(workspace, confined=False)
+    with ws.open_file(workspace / "link" / "f.txt") as f:
+        assert f.read() == b"host"
+
+
+def test_read_at_most_caps_the_actual_read(tmp_path):
+    import io
+
+    from dev_link_mcp.workspace import read_at_most
+
+    assert read_at_most(io.BytesIO(b"12345"), 5) == b"12345"
+    assert read_at_most(io.BytesIO(b"123456"), 5) is None

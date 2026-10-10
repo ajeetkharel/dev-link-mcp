@@ -2,7 +2,8 @@
 
 `systemd-run --scope` execs the command in place, so the pid and process group the Sandbox
 started stay the same and only the cgroup changes. The scope's cgroup holds every process the
-command starts, including bwrap and anything that detaches with setsid.
+command starts, including bwrap and anything that detaches with setsid, so killing the scope
+when the command ends takes all of them down.
 """
 
 from __future__ import annotations
@@ -21,9 +22,10 @@ log = logging.getLogger(__name__)
 _UNIT_PREFIX = "dev-link-cmd-"
 _SCOPE_NAME = re.compile(re.escape(_UNIT_PREFIX) + r"[0-9a-f]+\.scope")
 _CGROUP_ROOT = Path("/sys/fs/cgroup")
-# Reads back the limits the kernel applied, from inside the probe scope.
+# Reads back the limits the kernel applied, then the probe scope's own cgroup path.
 _READ_LIMITS = (
-    'cg=$(sed -n "s/^0:://p" /proc/self/cgroup); cat "/sys/fs/cgroup$cg/memory.max" "/sys/fs/cgroup$cg/pids.max"'
+    'cg=$(sed -n "s/^0:://p" /proc/self/cgroup); cat "/sys/fs/cgroup$cg/memory.max" "/sys/fs/cgroup$cg/pids.max";'
+    ' echo "$cg"'
 )
 
 
@@ -34,6 +36,9 @@ class ResourceLimits:
         self.memory_mb = memory_mb
         self.max_pids = max_pids
         self.systemd_run = shutil.which("systemd-run")
+        # The cgroup directory that holds our transient scopes, learned by available(); None
+        # until then. Lets a scope be found by its unit name after its first process is gone.
+        self.scope_parent: Path | None = None
 
     @property
     def active(self) -> bool:
@@ -73,7 +78,8 @@ class ResourceLimits:
         if done.returncode != 0:
             lines = done.stderr.strip().splitlines()
             return f"systemd-run --user failed ({lines[0] if lines else f'exit code {done.returncode}'})"
-        applied = done.stdout.split()
+        lines = done.stdout.split()
+        applied, own = lines[:-1], lines[-1:]
         # An unset limit reads back as "max" or systemd's DefaultTasksMax, so only set ones are compared.
         expected = [
             str(self.memory_mb * 1024 * 1024) if self.memory_mb is not None else None,
@@ -86,17 +92,33 @@ class ResourceLimits:
                 f"the systemd user manager did not apply them (cgroup reports memory.max and pids.max as"
                 f" {' '.join(applied) or 'unreadable'}); the memory and pids controllers must be delegated to it"
             )
+        # Every `systemd-run --user --scope` without --slice lands in the same parent cgroup.
+        if own and own[0].startswith("/") and ".." not in own[0].split("/"):
+            self.scope_parent = (_CGROUP_ROOT / own[0].lstrip("/")).parent
         return None
 
-    def wrap(self, argv: list[str], env: dict[str, str]) -> tuple[list[str], dict[str, str]]:
+    @staticmethod
+    def new_unit() -> str:
+        """A fresh, unique scope unit name for one command."""
+        return f"{_UNIT_PREFIX}{secrets.token_hex(6)}"
+
+    def scope_dir(self, unit: str) -> Path | None:
+        """cgroup directory of the scope `unit`, or None when available() has not located the scopes."""
+        if self.scope_parent is None:
+            return None
+        return self.scope_parent / f"{unit}.scope"
+
+    def wrap(self, argv: list[str], env: dict[str, str], unit: str | None = None) -> tuple[list[str], dict[str, str]]:
         """(argv, env) that run `argv` in a new scope with the limits.
+
+        `unit` names the scope (see new_unit); a fresh name is used when it is None.
 
         systemd-run finds the user manager through XDG_RUNTIME_DIR. When `env` lacks it (the
         sandboxed environment does), it is added for systemd-run and removed again before the
         command starts, so the command sees exactly `env`.
         """
         assert self.systemd_run is not None
-        unit = f"{_UNIT_PREFIX}{secrets.token_hex(6)}"
+        unit = unit or self.new_unit()
         # --collect removes the unit even when it failed, e.g. after an OOM kill; otherwise
         # every killed command would leave a failed scope behind.
         prefix = [self.systemd_run, "--user", "--scope", "--quiet", "--collect", f"--unit={unit}"]
@@ -112,19 +134,29 @@ def kill_scope(pid: int) -> None:
     """SIGKILL every process in the limits scope of `pid`, if it runs in one.
 
     The bubblewrap PID namespace already takes its processes down with it; this catches
-    commands under the `none` backend that left the process group with setsid.
+    commands under the `none` backend that left the process group with setsid. Needs `pid`
+    alive to find the scope; kill_scope_dir works after it is gone.
     """
     try:
         cgroup = Path(f"/proc/{pid}/cgroup").read_text()
     except OSError:
         return
     for line in cgroup.splitlines():
-        if not line.startswith("0::"):
-            continue
-        path = _CGROUP_ROOT / line[3:].lstrip("/")
-        if _SCOPE_NAME.fullmatch(path.name):
-            try:
-                (path / "cgroup.kill").write_text("1")
-            except OSError as exc:
-                # Kernels before 5.14 have no cgroup.kill; the process group was signalled anyway.
-                log.debug("cannot kill scope %s: %s", path.name, exc)
+        if line.startswith("0::"):
+            kill_scope_dir(_CGROUP_ROOT / line[3:].lstrip("/"))
+
+
+def kill_scope_dir(path: Path) -> None:
+    """SIGKILL every process in the scope cgroup `path`; a no-op when it is gone or not one of ours."""
+    if not _SCOPE_NAME.fullmatch(path.name):
+        return
+    try:
+        (path / "cgroup.kill").write_text("1")
+    except FileNotFoundError:
+        # Usually --collect already removed the emptied scope; a scope without cgroup.kill
+        # means a kernel before 5.14, where only the process group gets signalled.
+        if path.is_dir():
+            log.debug("cannot kill scope %s: no cgroup.kill", path.name)
+    except OSError as exc:
+        # The process group was signalled anyway.
+        log.debug("cannot kill scope %s: %s", path.name, exc)

@@ -25,7 +25,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from dev_link_mcp.config import Config
 from dev_link_mcp.sandbox.backends import Backend, SandboxUnavailable, select
-from dev_link_mcp.sandbox.limits import ResourceLimits, kill_scope
+from dev_link_mcp.sandbox.limits import ResourceLimits, kill_scope, kill_scope_dir
 
 __all__ = ["Capture", "RunResult", "Sandbox", "SandboxUnavailable", "kill_group_rest", "kill_tree", "pump"]
 
@@ -132,6 +132,8 @@ class Sandbox:
         self.backend: Backend = select(config, home=self.home, tmp=self.tmp)
         self.enabled = self.backend.confined
         self.limits = ResourceLimits(config.limits.memory_mb, config.limits.max_pids)
+        # Limits scope of each spawned process, by pid, until reap() kills it.
+        self._scopes: dict[int, Path | None] = {}
         if self.limits.active:
             reason = self.limits.available()
             if reason is not None:
@@ -233,9 +235,12 @@ class Sandbox:
         return env
 
     def _launch(
-        self, argv: Sequence[str], cwd: Path, env: Mapping[str, str] | None
+        self, argv: Sequence[str], cwd: Path, env: Mapping[str, str] | None, unit: str | None = None
     ) -> tuple[list[str], dict[str, str]]:
-        """(full argv, process environment) for starting `argv`. Raises ToolError for bad env entries."""
+        """(full argv, process environment) for starting `argv`. Raises ToolError for bad env entries.
+
+        `unit` names the limits scope when limits are active; a fresh name is used when it is None.
+        """
         for name, value in (env or {}).items():
             if not _ENV_NAME.fullmatch(name):
                 raise ToolError(f"invalid environment variable name: {name!r} (use letters, digits and _)")
@@ -247,8 +252,15 @@ class Sandbox:
         else:
             full, proc_env = self.backend.wrap(argv, cwd, {}), self.env(env)
         if self.limits.active:
-            full, proc_env = self.limits.wrap(full, proc_env)
+            full, proc_env = self.limits.wrap(full, proc_env, unit)
         return full, proc_env
+
+    def _new_scope(self) -> tuple[str | None, Path | None]:
+        """(unit name, cgroup directory) for the limits scope of a new command; Nones without limits."""
+        if not self.limits.active:
+            return None, None
+        unit = self.limits.new_unit()
+        return unit, self.limits.scope_dir(unit)
 
     def shell_argv(self, command: str) -> list[str]:
         return ["/bin/bash", "-c", command]
@@ -272,13 +284,16 @@ class Sandbox:
         """Run a command to completion inside the sandbox.
 
         `cwd` must already be resolved through Workspace. The process tree is killed on
-        timeout or when the calling task is cancelled. Raises ToolError if the program
-        cannot be started or an `env` name or value is invalid.
+        timeout or when the calling task is cancelled. Whatever the command left running in
+        its process group or limits scope (`cmd &` jobs) is killed when it returns, as the
+        bubblewrap PID namespace does. Raises ToolError if the program cannot be started or
+        an `env` name or value is invalid.
         """
         cwd = cwd or self.workspace
         timeout = self.clamp_timeout(timeout_s)
         limit = max_output_bytes or self.config.limits.max_output_bytes
-        full, proc_env = self._launch(argv, cwd, env)
+        unit, scope = self._new_scope()
+        full, proc_env = self._launch(argv, cwd, env, unit)
         started = time.monotonic()
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -311,6 +326,9 @@ class Sandbox:
                         await proc.wait()
                 except TimeoutError:
                     log.warning("process %s did not exit after SIGKILL", proc.pid)
+            # Under the `none` backend bash may have exited while a background job still holds
+            # its output open (that is what ran into the timeout), and nothing else ends that job.
+            _reap(proc.pid, scope)
         return RunResult(
             exit_code=proc.returncode,
             stdout=out.text(),
@@ -331,11 +349,12 @@ class Sandbox:
         """Start a long-running sandboxed process with stdout and stderr appended to `log_file`.
 
         stdin stays open as a pipe so the caller can send input. The caller owns the
-        process and must stop it with `kill_tree`.
+        process: it stops it with `kill_tree` and, once the process has exited, calls `reap`.
         """
-        full, proc_env = self._launch(argv, cwd, env)
+        unit, scope = self._new_scope()
+        full, proc_env = self._launch(argv, cwd, env, unit)
         try:
-            return await asyncio.create_subprocess_exec(
+            proc = await asyncio.create_subprocess_exec(
                 *full,
                 cwd=str(cwd),
                 env=proc_env,
@@ -346,6 +365,22 @@ class Sandbox:
             )
         except OSError as exc:  # missing program, no permission, argv too long
             raise ToolError(f"cannot start {argv[0]!r}: {exc}") from exc
+        self._scopes[proc.pid] = scope
+        return proc
+
+    def reap(self, pid: int) -> None:
+        """SIGKILL whatever a spawned process left behind after it exited: the rest of its
+        process group and everything in its limits scope, including setsid children.
+
+        Call it right after the process was reaped, so its pid cannot have been reused.
+        """
+        _reap(pid, self._scopes.pop(pid, None))
+
+
+def _reap(pid: int, scope: Path | None) -> None:
+    kill_group_rest(pid)
+    if scope is not None:
+        kill_scope_dir(scope)
 
 
 def kill_tree(pid: int, sig: int = signal.SIGKILL) -> None:

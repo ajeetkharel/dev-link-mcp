@@ -317,8 +317,8 @@ Returns text only.
 
 Run a shell command and wait for it to finish. Returns the exit code, duration, stdout
 and stderr; a non-zero exit is reported in the text, not as a tool error. Use start_process
-for servers, watchers and anything long-running: in the sandbox, background jobs (`cmd &`,
-nohup) are killed when the command returns. Sandboxed commands share a /tmp (emptied when
+for servers, watchers and anything long-running: background jobs (`cmd &`, nohup) are
+killed when the command returns. Sandboxed commands share a /tmp (emptied when
 the server starts) and a private HOME, both kept between calls.
 
 | Parameter | Type | Required | Default | Description |
@@ -338,7 +338,7 @@ Background processes: dev servers, watchers, REPLs and other long-running comman
 ### `list_processes`
 
 List background processes, running and exited, with id, name, command, cwd, pid,
-status, uptime and log size.
+status, uptime and log size. Only the 50 most recently exited processes are kept.
 
 No parameters.
 
@@ -347,7 +347,8 @@ Returns structured output (`structuredContent`) as well as text.
 ### `process_input`
 
 Write text to a running background process's stdin (answer a prompt, drive a REPL).
-Read the reply with process_output.
+Read the reply with process_output. Refused while the process has more than
+1 MiB of earlier input still unread.
 
 | Parameter | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
@@ -825,8 +826,9 @@ Docker containers, images and compose projects through the host docker CLI. Opt-
 Run docker compose for a compose file in the workspace. The resolved config is refused, with
 each problem listed, if it reaches outside the workspace (privileged, host namespaces, cap_add,
 devices, external volumes, paths outside the workspace, unknown keys, ...) or its project name
-belongs to containers from elsewhere. down keeps named volumes. A failing command is a tool
-error carrying compose's output.
+belongs to containers from elsewhere. down keeps named volumes. Containers started with up or
+restart are stopped (not removed) when the server stops. A failing command is a tool error
+carrying compose's output.
 
 | Parameter | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
@@ -916,7 +918,8 @@ Returns text only.
 Start a container labeled as belonging to this workspace, pulling the image if missing.
 The workspace is the only host mount allowed; privileged mode and host namespaces are not
 available. detach=True returns the container id and published ports; detach=False waits and
-returns the exit code and output, like run_command.
+returns the exit code and output, like run_command, and removes the container. Detached
+containers are stopped (not removed) when the server stops.
 
 | Parameter | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |

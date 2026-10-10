@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from conftest import text
 
-from dev_link_mcp.tools.data import _run_db, _value_type
+from dev_link_mcp.tools.data import _open_db, _run_db, _value_type
 
 
 def make_db(path: Path) -> None:
@@ -462,3 +462,23 @@ async def test_csv_preview_wide_file_scans_fewer_rows(connect, workspace, monkey
     async with connect("data") as client:
         r = await client.call_tool("csv_preview", {"path": "wide.csv", "rows": 0})
     assert "data rows: first 10 rows (file has more)" in text(r), text(r)
+
+
+def test_open_db_while_another_connection_reads_the_same_file(tmp_path):
+    # SQLite reuses the descriptor of a closed connection while another one holds a lock, so
+    # opening a third connection must not be mistaken for a swapped file.
+    db = tmp_path / "x.db"
+    with sqlite3.connect(db) as setup:
+        setup.execute("create table t(a)")
+        setup.executemany("insert into t values (?)", [(i,) for i in range(1000)])
+    setup.close()
+    expected = db.stat()
+    reader = _open_db(db, False, expected)
+    reader.execute("select a from t").fetchone()
+    second = _open_db(db, False, expected)
+    second.execute("select count(*) from t").fetchone()
+    second.close()
+    third = _open_db(db, False, expected)
+    assert third.execute("select count(*) from t").fetchone() == (1000,)
+    for conn in (third, reader):
+        conn.close()

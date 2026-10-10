@@ -161,7 +161,11 @@ class LimitsConfig(Section):
 
 class AuditConfig(Section):
     result_bytes: int = Field(
-        default=256_000, description="Bytes of each tool result kept in the audit log for the dashboard."
+        default=256_000,
+        description=(
+            "Bytes of each tool call's arguments and result kept in the audit log. Longer arguments are"
+            " stored as a clipped string instead of a JSON object."
+        ),
     )
     retention_days: int | None = Field(
         default=30,

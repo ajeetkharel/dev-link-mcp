@@ -113,7 +113,7 @@ What the audit log keeps.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `audit.result_bytes` | integer | `256000` | Bytes of each tool result kept in the audit log for the dashboard. |
+| `audit.result_bytes` | integer | `256000` | Bytes of each tool call's arguments and result kept in the audit log. Longer arguments are stored as a clipped string instead of a JSON object. |
 | `audit.retention_days` | integer or null | `30` | Audit events and background process logs older than this many days are deleted when the server starts. `null` keeps everything. |
 
 ## `tools`

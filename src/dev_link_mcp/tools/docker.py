@@ -8,6 +8,7 @@ files that ask for those, and only touch containers this workspace created.
 
 import asyncio
 import json
+import logging
 import os
 import re
 import secrets
@@ -25,6 +26,8 @@ from dev_link_mcp.runtime import Runtime
 from dev_link_mcp.sandbox import Capture, RunResult, kill_tree, pump
 from dev_link_mcp.tools.base import ToolGroup
 from dev_link_mcp.tools.common import DESTRUCTIVE, OPEN_WORLD, READ_ONLY, clip
+
+log = logging.getLogger(__name__)
 
 LABEL = "dev-link.workspace"
 _COMPOSE_DIR_LABEL = "com.docker.compose.project.working_dir"
@@ -63,6 +66,11 @@ _PORT = re.compile(
 
 _COMPOSE_FILES = ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml")
 _INSPECT_TIMEOUT_S = 30.0
+# `dev-link stop` sends SIGKILL 10 s after SIGTERM; uvicorn takes up to 3 s of that before the
+# groups shut down, all at once.
+_SHUTDOWN_TIMEOUT_S = 6.0
+_SHUTDOWN_STOP_GRACE_S = 2
+_MAX_COMPOSE_BYTES = 1024 * 1024
 _MAX_LIST = 500
 _MAX_TAIL = 10_000
 
@@ -79,9 +87,11 @@ async def run_docker(
     timeout_s: float,
     max_output_bytes: int,
     cwd: Path | None = None,
+    stdin: bytes | None = None,
 ) -> RunResult:
     """Run `docker <args>` on the host with a timeout, killing the CLI on timeout or cancel.
 
+    `stdin` is written to the CLI's standard input and then closed; None gives it /dev/null.
     Raises ToolError when the docker CLI is missing or the daemon cannot be reached, so
     callers only see results from a working daemon. A non-zero exit is returned, not raised.
     """
@@ -95,7 +105,7 @@ async def run_docker(
             *args,
             cwd=str(cwd) if cwd else None,
             env=_docker_env(),
-            stdin=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.DEVNULL if stdin is None else asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
@@ -104,10 +114,23 @@ async def run_docker(
         raise ToolError(f"cannot start docker: {exc}") from exc
     out, err = Capture(max_output_bytes), Capture(max_output_bytes // 4)
     timed_out = False
+
+    async def feed() -> None:
+        if stdin is None or proc.stdin is None:
+            return
+        try:
+            proc.stdin.write(stdin)
+            await proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            # The CLI exited without reading all of it; its exit code and stderr say why.
+            pass
+        finally:
+            proc.stdin.close()
+
     try:
         try:
             async with asyncio.timeout(timeout_s):
-                await asyncio.gather(pump(proc.stdout, out), pump(proc.stderr, err))
+                await asyncio.gather(feed(), pump(proc.stdout, out), pump(proc.stderr, err))
                 await proc.wait()
         except TimeoutError:
             timed_out = True
@@ -329,16 +352,39 @@ class DockerSettings(BaseModel):
     )
 
 
-def _register(mcp: MCPServer, rt: Runtime, settings: DockerSettings) -> None:
+def _owned(labels: dict[str, str], root: Path) -> bool:
+    """Whether a container with these labels was created from the workspace `root`."""
+    if labels.get(LABEL) == str(root):
+        return True
+    # An empty or relative value would resolve against the server's cwd.
+    compose_dir = Path(labels.get(_COMPOSE_DIR_LABEL) or "")
+    return compose_dir.is_absolute() and compose_dir.resolve().is_relative_to(root)
+
+
+class _Started:
+    """Containers and compose projects that this server started in the background, for shutdown()."""
+
+    def __init__(self) -> None:
+        self.containers: set[str] = set()
+        self.projects: set[str] = set()
+
+
+def _register(mcp: MCPServer, rt: Runtime, settings: DockerSettings, started: _Started) -> None:
     build_timeout_s = settings.build_timeout_s
     limits = rt.config.limits
     root = rt.workspace.root
     workspace_label = f"{LABEL}={root}"
 
     async def docker(
-        args: Sequence[str], *, timeout_s: float = _INSPECT_TIMEOUT_S, cwd: Path | None = None
+        args: Sequence[str],
+        *,
+        timeout_s: float = _INSPECT_TIMEOUT_S,
+        cwd: Path | None = None,
+        stdin: bytes | None = None,
     ) -> RunResult:
-        return await run_docker(args, timeout_s=timeout_s, max_output_bytes=limits.max_output_bytes, cwd=cwd)
+        return await run_docker(
+            args, timeout_s=timeout_s, max_output_bytes=limits.max_output_bytes, cwd=cwd, stdin=stdin
+        )
 
     def timeout(value: float | None, default: float | None = None) -> float:
         return rt.sandbox.clamp_timeout(value if value else default)
@@ -347,11 +393,7 @@ def _register(mcp: MCPServer, rt: Runtime, settings: DockerSettings) -> None:
         return ToolError(f"{what} failed\n{clip(result.format(), limits.max_output_bytes)}")
 
     def owned(labels: dict[str, str]) -> bool:
-        if labels.get(LABEL) == str(root):
-            return True
-        # An empty or relative value would resolve against the server's cwd.
-        compose_dir = Path(labels.get(_COMPOSE_DIR_LABEL) or "")
-        return compose_dir.is_absolute() and compose_dir.resolve().is_relative_to(root)
+        return _owned(labels, root)
 
     async def own_container(container: str) -> tuple[str, bool]:
         """Resolve a container name or id to its full id and running state.
@@ -529,7 +571,8 @@ def _register(mcp: MCPServer, rt: Runtime, settings: DockerSettings) -> None:
         """Start a container labeled as belonging to this workspace, pulling the image if missing.
         The workspace is the only host mount allowed; privileged mode and host namespaces are not
         available. detach=True returns the container id and published ports; detach=False waits and
-        returns the exit code and output, like run_command."""
+        returns the exit code and output, like run_command, and removes the container. Detached
+        containers are stopped (not removed) when the server stops."""
         _check_image(image)
         args = ["run", "--label", workspace_label]
         if name:
@@ -539,8 +582,8 @@ def _register(mcp: MCPServer, rt: Runtime, settings: DockerSettings) -> None:
             # needs a known name to clean up after a timeout or cancellation.
             name = f"dev-link-{secrets.token_hex(4)}"
             args += ["--name", name]
-        if detach:
-            args.append("--detach")
+        # A foreground run is over when the tool returns, so its exited container is only clutter.
+        args.append("--detach" if detach else "--rm")
         if mount_workspace:
             args += ["--mount", _mount_arg(root), "--workdir", "/workspace"]
         for spec in ports or []:
@@ -556,7 +599,9 @@ def _register(mcp: MCPServer, rt: Runtime, settings: DockerSettings) -> None:
             result = await docker(args, timeout_s=timeout(None, build_timeout_s))
             if not result.ok:
                 raise fail(f"docker run {image}", result)
-            cid = result.stdout.strip().splitlines()[-1][:12]
+            full_id = result.stdout.strip().splitlines()[-1]
+            started.containers.add(full_id)
+            cid = full_id[:12]
             port_info = await docker(["port", cid])
             lines = [f"started container {cid}" + (f" ({name})" if name else "") + f" from {image}"]
             published = port_info.stdout.strip() if port_info.ok else ""
@@ -573,7 +618,7 @@ def _register(mcp: MCPServer, rt: Runtime, settings: DockerSettings) -> None:
             return result.format() + f"\ncontainer {name} was killed and removed"
         if result.exit_code == 125:
             raise fail(f"docker run {image}", result)
-        return clip(result.format(), limits.max_output_bytes) + f"\ncontainer: {name}"
+        return clip(result.format(), limits.max_output_bytes) + f"\ncontainer {name} exited and was removed"
 
     @mcp.tool(annotations=READ_ONLY)
     async def docker_logs(
@@ -673,16 +718,29 @@ def _register(mcp: MCPServer, rt: Runtime, settings: DockerSettings) -> None:
         """Run docker compose for a compose file in the workspace. The resolved config is refused, with
         each problem listed, if it reaches outside the workspace (privileged, host namespaces, cap_add,
         devices, external volumes, paths outside the workspace, unknown keys, ...) or its project name
-        belongs to containers from elsewhere. down keeps named volumes. A failing command is a tool
-        error carrying compose's output."""
+        belongs to containers from elsewhere. down keeps named volumes. Containers started with up or
+        restart are stopped (not removed) when the server stops. A failing command is a tool error
+        carrying compose's output."""
         path = compose_file(file)
         for svc in services or []:
             _check_name(svc, "service")
-        base = ["compose", "--ansi", "never", "--progress", "plain", "--file", str(path)]
+        # The file is read once and goes to the check over stdin; --project-directory keeps relative
+        # paths and .env as they would be with --file.
+        try:
+            with rt.workspace.open_file(path) as fh:
+                content = fh.read(_MAX_COMPOSE_BYTES + 1)
+        except OSError as exc:
+            raise ToolError(f"cannot read compose file {rt.workspace.rel(path)}: {exc}") from exc
+        if len(content) > _MAX_COMPOSE_BYTES:
+            raise ToolError(f"compose file is larger than {_MAX_COMPOSE_BYTES} bytes: {rt.workspace.rel(path)}")
+        base = ["compose", "--ansi", "never", "--progress", "plain", "--file", "-"]
+        base += ["--project-directory", str(path.parent)]
         # Every action is checked: provider services run a host program even on down, and the
         # project name (from the file or .env) could point at another project's containers.
         # --no-env-resolution keeps env_file paths in the output instead of inlining their contents.
-        checked = await docker([*base, "config", "--no-env-resolution", "--format", "json"], cwd=path.parent)
+        checked = await docker(
+            [*base, "config", "--no-env-resolution", "--format", "json"], cwd=path.parent, stdin=content
+        )
         if not checked.ok:
             raise fail("compose config", checked)
         config = json.loads(checked.stdout)
@@ -700,8 +758,17 @@ def _register(mcp: MCPServer, rt: Runtime, settings: DockerSettings) -> None:
             "build": ["build"],
             "restart": ["restart"],
         }[action]
+        if action in ("up", "restart"):
+            # Recorded before running, so containers from an up that times out are stopped too.
+            started.projects.add(project)
         result = await docker(
-            [*base, *sub, *(services or [])], timeout_s=timeout(timeout_s, build_timeout_s), cwd=path.parent
+            [*base, *sub, *(services or [])],
+            timeout_s=timeout(timeout_s, build_timeout_s),
+            cwd=path.parent,
+            # The resolved config that passed the check, not the file: .env, include and extends
+            # are read again by path and could be swapped in between. Compose keeps literal $ escaped
+            # as $$ in this output, so nothing is substituted twice.
+            stdin=checked.stdout.encode(),
         )
         if not result.ok:
             raise fail(f"compose {action}", result)
@@ -717,5 +784,56 @@ class DockerGroup(ToolGroup):
     Settings = DockerSettings
     settings: DockerSettings
 
+    def __init__(self, rt: Runtime, settings: BaseModel) -> None:
+        super().__init__(rt, settings)
+        self._started = _Started()
+
     def register(self, mcp: MCPServer) -> None:
-        _register(mcp, self.rt, self.settings)
+        _register(mcp, self.rt, self.settings, self._started)
+
+    async def shutdown(self) -> None:
+        """Stop the detached containers and compose projects this server started, like background
+        processes are killed when the server stops. Containers are kept (so are volumes) and can be
+        started again. Never raises; failures and the time limit are logged as warnings."""
+        if not self._started.containers and not self._started.projects:
+            return
+        try:
+            async with asyncio.timeout(_SHUTDOWN_TIMEOUT_S):
+                await self._stop_started()
+        except (ToolError, OSError, TimeoutError) as exc:
+            log.warning("could not stop docker containers started by this server: %s", exc)
+
+    async def _stop_started(self) -> None:
+        root = self.rt.workspace.root
+        max_bytes = self.rt.config.limits.max_output_bytes
+        ids = set(self._started.containers)
+        for project in sorted(self._started.projects):
+            listed = await run_docker(
+                [
+                    "ps",
+                    "--no-trunc",
+                    "--filter",
+                    f"label=com.docker.compose.project={project}",
+                    "--filter",
+                    f"label={_COMPOSE_DIR_LABEL}",
+                    "--format",
+                    f'{{{{.ID}}}}\t{{{{.Label "{_COMPOSE_DIR_LABEL}"}}}}',
+                ],
+                timeout_s=_SHUTDOWN_TIMEOUT_S,
+                max_output_bytes=max_bytes,
+            )
+            for line in listed.stdout.splitlines():
+                cid, _, compose_dir = line.partition("\t")
+                # Same ownership rule as the tools: another project may have taken the name since.
+                if _owned({_COMPOSE_DIR_LABEL: compose_dir}, root):
+                    ids.add(cid)
+        if not ids:
+            return
+        # A container removed in the meantime makes docker stop exit non-zero; the others still stop.
+        result = await run_docker(
+            ["stop", "--time", str(_SHUTDOWN_STOP_GRACE_S), *sorted(ids)],
+            timeout_s=_SHUTDOWN_TIMEOUT_S,
+            max_output_bytes=max_bytes,
+        )
+        if not result.ok and "no such container" not in result.stderr.lower():
+            log.warning("docker stop at shutdown failed: %s", result.stderr.strip())

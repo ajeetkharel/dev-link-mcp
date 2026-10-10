@@ -12,11 +12,11 @@ import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, BinaryIO, Literal
 
 from mcp.server.mcpserver.exceptions import ToolError
 
-from dev_link_mcp.workspace import Workspace
+from dev_link_mcp.workspace import Workspace, read_at_most
 
 LIST_MAX = 2000
 TEXT_DEFAULT = 256 * 1024
@@ -155,13 +155,16 @@ class FileBrowser:
         if not path.is_dir():
             raise BrowseError(400, f"not a directory: {raw}")
         entries: list[dict[str, Any]] = []
-        with os.scandir(path) as it:
-            for entry in it:
-                if entry.name == ".git":
-                    continue
-                item = self._entry(Path(entry.path), entry)
-                if item is not None:
-                    entries.append(item)
+        try:
+            with self.workspace.open_dir(path) as fd, os.scandir(fd) as it:
+                for entry in it:
+                    if entry.name == ".git":
+                        continue
+                    item = self._entry(path / entry.name, entry)
+                    if item is not None:
+                        entries.append(item)
+        except ToolError as exc:
+            raise BrowseError(400, str(exc)) from None
         entries.sort(key=lambda e: (e["type"] != "dir" and e.get("target") != "dir", e["name"].lower(), e["name"]))
         total = len(entries)
         return {
@@ -209,6 +212,18 @@ class FileBrowser:
             raise BrowseError(400, f"not a regular file: {raw}")
         return path
 
+    def open_download(self, raw: str) -> tuple[BinaryIO, str]:
+        """(open binary handle, file name) of a whole file for download. The caller closes the handle.
+
+        Opened like `read`, so a file or directory swapped after the check is refused instead of
+        followed. Raises BrowseError as `regular_file` does, and 400 for a swapped path.
+        """
+        path = self.regular_file(raw)
+        try:
+            return self.workspace.open_file(path), path.name
+        except ToolError as exc:
+            raise BrowseError(400, str(exc)) from None
+
     def read(self, raw: str, offset: int = 0, limit: int = TEXT_DEFAULT) -> Chunk:
         """A preview chunk of one file. Blocking file IO.
 
@@ -219,14 +234,21 @@ class FileBrowser:
         """
         path = self.regular_file(raw)
         limit = max(1, min(limit, RAW_MAX))
-        with path.open("rb") as fh:
+        try:
+            # Not path.open(): the file could be swapped for a FIFO (blocks forever) or a
+            # directory above it for a symlink to a host directory since `regular_file` checked.
+            fh = self.workspace.open_file(path)
+        except ToolError as exc:
+            raise BrowseError(400, str(exc)) from None
+        with fh:
             size = os.fstat(fh.fileno()).st_size
             head = fh.read(_SNIFF)
             kind, mime = sniff(head, whole=len(head) >= size)
             if kind == "image" and size <= IMAGE_MAX:
                 fh.seek(0)
-                data = fh.read()
-                return Chunk("image", mime, data, 0, len(data), size)
+                image = read_at_most(fh, IMAGE_MAX)
+                if image is not None:
+                    return Chunk("image", mime, image, 0, len(image), len(image))
             if kind == "image":
                 kind, mime = "binary", "application/octet-stream"
             offset = max(0, min(offset, size))
