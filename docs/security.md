@@ -53,8 +53,9 @@ because each command has its own loopback.
 Some tools do not run in the sandbox, and the network setting means something different for them:
 
 - `http_request`, `fetch_url`, `download_file` and the browser run in the server process, where
-  loopback is the host's loopback. With the network off the HTTP tools refuse every request, and
-  the browser loads only `about:`, `data:` and `blob:` URLs, with WebRTC turned off. Loopback and
+  loopback is the host's loopback. With the network off the HTTP tools refuse every request, the
+  browser tools open only `about:blank`, and pages load only `data:`, `blob:` and `about:`
+  resources, with WebRTC turned off. Loopback and
   `localhost` are refused too, so they cannot reach services on your machine. The process tools
   refuse to wait for a port, because that probe would also hit the host's loopback.
 - With the network off, docker containers run with `--network none`. Compose services share

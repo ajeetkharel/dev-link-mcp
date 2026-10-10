@@ -4,13 +4,15 @@ ChatGPT and Grok run in the vendor's cloud, not on your machine. They connect on
 they can reach from the internet over HTTPS, so dev-link has to be published through a tunnel.
 
 **Read this first.** Anyone with the public URL can run commands on your machine, inside the
-sandbox described in [security.md](../security.md). The URL holds the token, so share it only
-with the client, and stop the server when you are done.
+sandbox described in [security.md](../security.md). With `--no-sandbox`, which macOS needs, they
+get your full user access instead. The URL holds the token, so share it only with the client,
+and stop the server when you are done.
 
 ## Install cloudflared
 
 `--tunnel` starts a Cloudflare quick tunnel, which needs the `cloudflared` binary but no
-Cloudflare account. Install it from Cloudflare's package repository.
+Cloudflare account. The [install script](../../scripts/install.sh) puts it in `~/.local/bin` on
+Linux. To install it from Cloudflare's package repository instead:
 
 Debian and Ubuntu:
 
@@ -22,7 +24,7 @@ echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudf
 sudo apt-get update && sudo apt-get install cloudflared
 ```
 
-RHEL, CentOS and other `yum`/`dnf` systems:
+RHEL:
 
 ```bash
 curl -fsSL https://pkg.cloudflare.com/cloudflared.repo | sudo tee /etc/yum.repos.d/cloudflared.repo
@@ -55,7 +57,7 @@ work here.
 5. Install the plugin, then pick it in a new chat.
 
 ChatGPT asks you to confirm each call to a tool that writes. dev-link marks the tools that only
-read, so those run without asking.
+read as read-only, so ChatGPT treats them as reads.
 
 Which plans can add custom MCP servers, and which allow tools that write, has changed several
 times, and workspace admins can turn the feature off. Check OpenAI's help article

@@ -12,9 +12,9 @@ format may change between minor releases; every such change is listed here.
 ### Changed
 
 - With the network off, `http_request`, `fetch_url`, `download_file` and the browser no longer
-  reach the host's loopback. The HTTP tools refuse every request, and the browser loads only
-  `about:`, `data:` and `blob:` URLs, with WebRTC turned off. `start_process` and
-  `wait_for_process` refuse to wait for a port.
+  reach the host's loopback. The HTTP tools refuse every request, the browser tools open only
+  `about:blank`, and pages load only `data:`, `blob:` and `about:` resources, with WebRTC turned
+  off. `start_process` and `wait_for_process` refuse to wait for a port.
 - With the network off, the docker group no longer gives containers network access. Containers
   run with `--network none`, compose services share internal networks isolated from the host
   (Docker 28 or newer), and published ports, image pulls and image builds are refused.
