@@ -388,20 +388,27 @@ async def test_detect_symlinked_manifest_outside_is_not_read(connect, workspace,
 
 
 @pytest.mark.parametrize(
-    ("name", "content", "detector"),
+    ("name", "content", "expected"),
     [
-        ("pyproject.toml", 'project = "x"\n', "python"),
-        ("pyproject.toml", "[project]\ndependencies = 1\n", "python"),
-        ("Cargo.toml", "workspace = 1\n", "rust"),
-        ("package.json", "[" * 100_000 + "]" * 100_000, "node"),
-        ("compose.yaml", "[" * 50_000 + "]" * 50_000, "compose"),
+        ("pyproject.toml", 'project = "x"\n', ("python manifest has an unexpected structure",)),
+        ("pyproject.toml", "[project]\ndependencies = 1\n", ("python manifest has an unexpected structure",)),
+        ("Cargo.toml", "workspace = 1\n", ("rust manifest has an unexpected structure",)),
+        # Python 3.14 bounds json's recursion by the C stack left, so with a large stack the array
+        # parses (and is not an object) and with a small one it raises RecursionError.
+        (
+            "package.json",
+            "[" * 100_000 + "]" * 100_000,
+            ("node manifest has an unexpected structure", "package.json does not contain an object"),
+        ),
+        ("compose.yaml", "[" * 50_000 + "]" * 50_000, ("compose manifest has an unexpected structure",)),
     ],
+    ids=["pyproject-string", "pyproject-dependencies", "cargo-workspace", "package-json-nested", "compose-nested"],
 )
-async def test_detect_wrongly_typed_manifest_warns(connect, workspace, name, content, detector):
+async def test_detect_wrongly_typed_manifest_warns(connect, workspace, name, content, expected):
     write(workspace, name, content)
     write(workspace, "go.mod", "module example.com/x\n")
     data = await detect(connect)
-    assert any(w.startswith(f"{detector} manifest has an unexpected structure") for w in data["warnings"])
+    assert any(w.startswith(expected) for w in data["warnings"])
     # The other detectors still ran.
     assert data["commands"]["test"] == "go test ./..."
 
