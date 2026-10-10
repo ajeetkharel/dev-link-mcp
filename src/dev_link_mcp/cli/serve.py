@@ -36,7 +36,7 @@ def _terminate(sig: int, frame: FrameType | None) -> None:
 def cmd_serve(args: argparse.Namespace) -> int:
     # The server stack (uvicorn, the MCP SDK, every tool group) loads only here, so stop and
     # status stay quick.
-    from dev_link_mcp.app import serve
+    from dev_link_mcp.app import ServeAborted, serve
     from dev_link_mcp.sandbox import SandboxUnavailable
     from dev_link_mcp.tools import ToolGroupError
 
@@ -61,19 +61,47 @@ def cmd_serve(args: argparse.Namespace) -> int:
     previous = signal.signal(signal.SIGTERM, _terminate)
     try:
         if args.tunnel:
-            tunnel = Tunnel.start(config.base_url(), config.state_dir / instance.TUNNEL_LOG)
+            tunnel = Tunnel.start(
+                config.base_url(), config.state_dir / instance.TUNNEL_LOG, secrets=[config.server.token]
+            )
             config.server.public_url = tunnel.url
-        logging.basicConfig(level=config.log_level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+        configure_logging(config)
         with contextlib.suppress(KeyboardInterrupt):
-            asyncio.run(serve(config, on_shutdown=tunnel.stop if tunnel else None))
+            asyncio.run(
+                serve(
+                    config,
+                    on_shutdown=tunnel.stop if tunnel else None,
+                    # A server whose public URL is dead would look healthy to `dev-link status`
+                    # while remote clients fail, so it stops and says why.
+                    abort_when=tunnel.failure if tunnel else None,
+                )
+            )
     except (ToolGroupError, SandboxUnavailable) as exc:
         raise CliError.from_exc(exc) from None
+    except ServeAborted as exc:
+        log_path = config.state_dir / instance.TUNNEL_LOG
+        raise CliError(f"{exc}; last lines of {log_path}:", details=instance.tail(log_path, 20)) from None
     finally:
         if tunnel is not None:
             tunnel.stop()
         signal.signal(signal.SIGTERM, previous)
         lock.release()
     return 0
+
+
+def configure_logging(config: Config) -> None:
+    """Send log records to stderr at `config.log_level`, with the server token replaced by ***
+    in each one, tracebacks included. Like logging.basicConfig, does nothing when the root
+    logger already has handlers."""
+    from dev_link_mcp.audit import SecretLogFilter
+
+    # On the handler, not the root logger: records from other loggers reach root's handlers
+    # without passing root's own filters.
+    handler = logging.StreamHandler()
+    handler.addFilter(SecretLogFilter([config.server.token]))
+    logging.basicConfig(
+        level=config.log_level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s", handlers=[handler]
+    )
 
 
 def _server_flags(args: argparse.Namespace) -> list[str]:

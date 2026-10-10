@@ -63,7 +63,7 @@ groups:
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `workspace` | path | required | Folder exposed to the agent and the only place it can write. Usually given as the command-line argument. Must not be `/`, your home folder, or a parent of it. |
-| `state_dir` | path or null | `null` | Where logs, the audit store and the sandbox home live. Must be outside the workspace. Default: `$XDG_STATE_HOME/dev-link-mcp/<folder name>-<hash>`. |
+| `state_dir` | path or null | `null` | Where logs, the audit store and the sandbox home live. Must be outside the workspace and, with a sandbox, outside every folder it mounts (system folders, `sandbox.ro_paths`, `sandbox.rw_paths`) with none of them inside it. Default: `$XDG_STATE_HOME/dev-link-mcp/<folder name>-<hash>`. |
 | `log_level` | one of `DEBUG`, `INFO`, `WARNING`, `ERROR` | `"INFO"` | Server log level. Lower case is accepted. |
 | `groups` | mapping of string to mapping | `{}` | Settings of each tool group, keyed by group name. Each group checks its own keys at start; see Tool groups below. |
 
@@ -88,8 +88,8 @@ Isolation of agent commands.
 | --- | --- | --- | --- |
 | `sandbox.backend` | one of `auto`, `bubblewrap`, `none` | `"auto"` | How agent commands are isolated. `bubblewrap` confines them to the workspace (Linux only); `none` runs them with full access to your machine, like a coding agent run directly. `auto` uses bubblewrap and refuses to start when it cannot run here (not Linux, `bwrap` missing, or user namespaces blocked); it never falls back to `none`. |
 | `sandbox.network` | boolean | `true` | Allow network access inside the sandbox. |
-| `sandbox.ro_paths` | list of strings | `["~/.nvm", "~/.local/bin", "~/.local/share/uv/python", "~/.sdkman", "~/.cargo/bin", "~/.rustup", "~/go", "~/.pyenv", "~/.bun", "~/.deno"]` | Host paths mounted read-only inside the sandbox in addition to the system folders. Missing paths are skipped, so one config works across machines. |
-| `sandbox.rw_paths` | list of strings | `[]` | Host paths mounted read-write. Anything here is reachable by the agent. |
+| `sandbox.ro_paths` | list of strings | `["~/.nvm", "~/.local/bin", "~/.local/share/uv/python", "~/.sdkman", "~/.cargo/bin", "~/.rustup", "~/go", "~/.pyenv", "~/.bun", "~/.deno"]` | Host paths mounted read-only inside the sandbox in addition to the system folders. Missing paths are skipped, so one config works across machines. None may lie inside the workspace or a `rw_paths` entry, where the agent could swap it for a symlink. |
+| `sandbox.rw_paths` | list of strings | `[]` | Host paths mounted read-write. Anything here is reachable by the agent. None may lie inside the workspace or another entry. |
 | `sandbox.env_passthrough` | list of strings | `["LANG", "LC_ALL", "TZ", "JAVA_HOME", "MAVEN_HOME", "GOPATH", "NVM_DIR"]` | Host environment variables copied into the sandbox. Everything else is dropped so server secrets do not leak into agent commands. |
 | `sandbox.env` | mapping of string to string | `{}` | Extra environment variables for agent commands. Values must be strings: quote numbers in YAML. |
 
@@ -114,7 +114,7 @@ What the audit log keeps.
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `audit.result_bytes` | integer | `256000` | Bytes of each tool call's arguments and result kept in the audit log. Longer arguments are stored as a clipped string instead of a JSON object. |
-| `audit.retention_days` | integer or null | `30` | Audit events and background process logs older than this many days are deleted when the server starts. `null` keeps everything. |
+| `audit.retention_days` | integer or null | `30` | Audit events and background process logs older than this many days are deleted when the server starts and once a day while it runs. Logs of processes the server still lists are kept. `null` keeps everything. |
 
 ## `tools`
 

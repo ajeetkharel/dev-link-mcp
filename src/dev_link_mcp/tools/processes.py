@@ -106,6 +106,15 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
         managed = rt.processes.get(process_id)
         return _read_utf8_chunk(managed.log_path, offset, limits.max_output_bytes, final=not managed.running)
 
+    def check_port_wait(port: int | None, option: str, instead: str) -> None:
+        """Refuse a port wait when the sandbox network is off. Each sandboxed command then has its
+        own network namespace, so the server's loopback probe would reach the host's ports instead."""
+        if port is not None and not rt.config.sandbox.network:
+            raise ToolError(
+                f"network access is off on this server, so {option} cannot see the process's ports;"
+                f" wait for a line in its output with {instead} instead"
+            )
+
     async def wait(process_id: str, pattern: str | None, port: int | None, timeout_s: float) -> str:
         """ProcessManager.wait_for with a timeout message that names what was awaited."""
         rt.processes.get(process_id)  # an unknown id must surface as such, not as a timeout
@@ -133,7 +142,11 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
             str | None, Field(description="Regex; return once the output matches it (e.g. 'listening on').")
         ] = None,
         wait_for_port: Annotated[
-            int | None, Field(description="Return once this TCP port accepts connections on 127.0.0.1 or ::1.")
+            int | None,
+            Field(
+                description="Return once this TCP port accepts connections on 127.0.0.1 or ::1."
+                " Refused when the server has network access off."
+            ),
         ] = None,
         wait_timeout_s: Annotated[
             float, Field(description="Max seconds to wait for the pattern or port.", gt=0)
@@ -148,6 +161,7 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
         _check_start_args(command, name, env)
         _check_pattern(wait_for_pattern)
         _check_port(wait_for_port)
+        check_port_wait(wait_for_port, "wait_for_port", "wait_for_pattern")
         workdir = rt.workspace.resolve(cwd, must_exist=True)
         if not workdir.is_dir():
             raise ToolError(f"cwd is not a directory: {rt.workspace.rel(workdir)}")
@@ -229,13 +243,19 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
     async def wait_for_process(
         id: Annotated[str, Field(description="Process id from start_process.")],
         pattern: Annotated[str | None, Field(description="Regex to wait for in the output.")] = None,
-        port: Annotated[int | None, Field(description="TCP port to wait for on 127.0.0.1 or ::1.")] = None,
+        port: Annotated[
+            int | None,
+            Field(
+                description="TCP port to wait for on 127.0.0.1 or ::1. Refused when the server has network access off."
+            ),
+        ] = None,
         timeout_s: Annotated[float, Field(description="Max seconds to wait.", gt=0)] = 30.0,
     ) -> str:
         """Wait until a background process's output matches a regex, a port accepts connections,
         or the process exits, whichever comes first. Fails on timeout; the process keeps running."""
         _check_pattern(pattern)
         _check_port(port)
+        check_port_wait(port, "port", "pattern")
         waited = await wait(id, pattern, port, min(timeout_s, limits.max_timeout_s))
         return f"{waited}\n{status_line(id)}"
 

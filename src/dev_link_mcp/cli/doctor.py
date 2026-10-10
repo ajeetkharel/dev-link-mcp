@@ -67,6 +67,12 @@ def _sandbox(config: Config) -> Check:
         )
     assert config.state_dir is not None
     backend = Bubblewrap(config, home=config.state_dir / "home", tmp=config.state_dir / "tmp")
+    exposed = backend.exposed_state()
+    if exposed is not None:
+        return Check("fail", "sandbox", exposed, "move state_dir out of every folder the sandbox mounts")
+    replaceable = backend.replaceable_mount()
+    if replaceable is not None:
+        return Check("fail", "sandbox", replaceable, "move that path out of the workspace, rw_paths and state_dir")
     reason = backend.available()
     if reason is None:
         return Check("ok", "sandbox", f"bubblewrap ({backend.bwrap}) can create a sandbox")

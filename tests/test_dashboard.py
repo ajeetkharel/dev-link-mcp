@@ -265,6 +265,19 @@ async def test_processes_list_log_and_stop(serve, workspace):
         assert (await s.http.get(f"{s.api}/processes/{proc.id}/stop")).status_code == 405
 
 
+async def test_process_log_route_never_shows_the_token(serve, workspace):
+    async with serve() as s:
+        token = s.config.server.token
+        proc = await s.rt.processes.start(f"echo url /mcp/{token}/x", cwd=workspace)
+        await s.rt.processes.wait_for(proc.id, timeout_s=10)
+        await proc.watcher
+        # Redacted on its way into the log file, so the route has nothing left to hide.
+        assert token.encode() not in proc.log_path.read_bytes()
+        full = (await s.http.get(f"{s.api}/processes/{proc.id}/log", params={"offset": 0})).json()
+        tail = (await s.http.get(f"{s.api}/processes/{proc.id}/log", params={"tail": 5})).json()
+    assert full["text"] == "url /mcp/***/x\n" and tail["text"] == "url /mcp/***/x"
+
+
 async def test_tasks_snapshot_route(serve):
     async with serve() as s:
         assert "tasks" in s.groups

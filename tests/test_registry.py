@@ -411,6 +411,9 @@ async def test_server_shutdown_calls_shutdown_on_every_group(
     tmp_path, workspace, monkeypatch, recorders, caplog, fails
 ):
     class FakeUvicorn:
+        abort_when = None
+        aborted = None
+
         def __init__(self, config: Any) -> None:
             pass
 

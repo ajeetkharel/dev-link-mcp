@@ -391,3 +391,25 @@ async def test_wait_for_process_reports_a_runaway_pattern(connect):
         assert "did not finish" in text(r) and "backtracking" in text(r)
         r = await client.call_tool("wait_for_process", {"id": "p1", "pattern": "a!", "timeout_s": 5})
         assert not r.is_error, text(r)
+
+
+async def test_network_off_refuses_port_waits(connect, rt):
+    # Each sandboxed command has its own network namespace, so the server's probe of the
+    # loopback would see the host's listener here, not the process's.
+    rt.config.sandbox.network = False
+    with socket.socket() as host_listener:
+        host_listener.bind(("127.0.0.1", 0))
+        host_listener.listen()
+        port = host_listener.getsockname()[1]
+        async with connect("processes") as client:
+            r = await client.call_tool("start_process", {"command": "sleep 30", "wait_for_port": port})
+            assert r.is_error
+            assert "network access is off on this server" in text(r) and "wait_for_pattern" in text(r)
+            assert rt.processes.list() == []
+            r = await client.call_tool("start_process", {"command": "echo up; sleep 30", "wait_for_pattern": "up"})
+            assert not r.is_error, text(r)
+            r = await client.call_tool("wait_for_process", {"id": "p1", "port": port, "timeout_s": 1})
+            assert r.is_error
+            assert "network access is off on this server" in text(r) and "pattern" in text(r)
+            r = await client.call_tool("wait_for_process", {"id": "p1", "pattern": "up", "timeout_s": 5})
+            assert not r.is_error, text(r)

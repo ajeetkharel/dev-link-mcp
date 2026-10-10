@@ -21,7 +21,7 @@ _OPT_OUT = "or pass --no-sandbox (sandbox.backend: none) to run agent commands w
 
 
 class SandboxUnavailable(RuntimeError):
-    """The configured sandbox cannot run on this machine; the server must not start."""
+    """The configured sandbox cannot run here, or its mounts are unsafe; the server must not start."""
 
 
 class Backend(Protocol):
@@ -47,12 +47,16 @@ def select(config: Config, *, home: Path, tmp: Path) -> Backend:
 
     `home` and `tmp` are the private home and /tmp directories prepared by the Sandbox. `none`
     is always allowed and logs a warning. `auto` and `bubblewrap` raise SandboxUnavailable when
-    bubblewrap cannot run here; there is no silent fallback to `none`.
+    a sandbox mount would expose the state dir, when the agent could swap a mount source for a
+    symlink, or when bubblewrap cannot run here; there is no silent fallback to `none`.
     """
     if config.sandbox.backend == "none":
         log.warning("sandbox backend is none: agent commands run with your full user access")
         return Unconfined()
     backend = Bubblewrap(config, home=home, tmp=tmp)
+    exposed = backend.exposed_state() or backend.replaceable_mount()
+    if exposed is not None:
+        raise SandboxUnavailable(f"refusing to start the {backend.name} sandbox: {exposed}")
     reason = backend.available()
     if reason is not None:
         raise SandboxUnavailable(f"cannot start the {backend.name} sandbox: {reason}; {_OPT_OUT}")

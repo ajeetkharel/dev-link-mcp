@@ -386,7 +386,7 @@ when the server stops.
 | `cwd` | string | no | `"."` | Working directory, relative to the workspace root. |
 | `env` | mapping of string to string or null | no | `null` | Extra environment variables. |
 | `wait_for_pattern` | string or null | no | `null` | Regex; return once the output matches it (e.g. 'listening on'). |
-| `wait_for_port` | integer or null | no | `null` | Return once this TCP port accepts connections on 127.0.0.1 or ::1. |
+| `wait_for_port` | integer or null | no | `null` | Return once this TCP port accepts connections on 127.0.0.1 or ::1. Refused when the server has network access off. |
 | `wait_timeout_s` | number (> 0) | no | `30.0` | Max seconds to wait for the pattern or port. |
 
 Returns text only.
@@ -411,7 +411,7 @@ or the process exits, whichever comes first. Fails on timeout; the process keeps
 | --- | --- | --- | --- | --- |
 | `id` | string | yes | - | Process id from start_process. |
 | `pattern` | string or null | no | `null` | Regex to wait for in the output. |
-| `port` | integer or null | no | `null` | TCP port to wait for on 127.0.0.1 or ::1. |
+| `port` | integer or null | no | `null` | TCP port to wait for on 127.0.0.1 or ::1. Refused when the server has network access off. |
 | `timeout_s` | number (> 0) | no | `30.0` | Max seconds to wait. |
 
 Returns text only.
@@ -825,10 +825,13 @@ Docker containers, images and compose projects through the host docker CLI. Opt-
 
 Run docker compose for a compose file in the workspace. The resolved config is refused, with
 each problem listed, if it reaches outside the workspace (privileged, host namespaces, cap_add,
-devices, external volumes, paths outside the workspace, unknown keys, ...) or its project name
-belongs to containers from elsewhere. down keeps named volumes. Containers started with up or
-restart are stopped (not removed) when the server stops. A failing command is a tool error
-carrying compose's output.
+devices, external volumes, network-share volumes, paths outside the workspace, unknown keys,
+...) or its project name belongs to containers from elsewhere. down keeps named volumes.
+Containers started with up or restart are stopped (not removed) when the server stops. With the
+server's network off, up, restart and build put every service on internal networks (services
+reach each other, not the host or anything else; needs Docker 28 or newer) and never pull;
+builds, ports, external networks and images or image volumes missing locally are refused. A
+failing command is a tool error carrying compose's output.
 
 | Parameter | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
@@ -843,8 +846,9 @@ Returns text only.
 
 ### `docker_build`
 
-Build an image from a Dockerfile in the workspace; base images may be pulled. Returns the
-build log (clipped); a failed build is a tool error carrying the log.
+Build an image from a Dockerfile in the workspace; base images may be pulled. Refused when
+the server's network is off. Returns the build log (clipped); a failed build is a tool error
+carrying the log.
 
 | Parameter | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
@@ -859,7 +863,8 @@ Returns text only.
 
 Run a shell command inside a running container started from this workspace. The image must
 have `sh`. Returns exit code, stdout and stderr; a non-zero exit is reported in the text. On timeout
-only the docker client is killed; the command may keep running in the container.
+only the docker client is killed; the command may keep running in the container. With the
+server's network off, containers that have network access (started while it was on) are refused.
 
 | Parameter | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
@@ -919,7 +924,9 @@ Start a container labeled as belonging to this workspace, pulling the image if m
 The workspace is the only host mount allowed; privileged mode and host namespaces are not
 available. detach=True returns the container id and published ports; detach=False waits and
 returns the exit code and output, like run_command, and removes the container. Detached
-containers are stopped (not removed) when the server stops.
+containers are stopped (not removed) when the server stops. With the server's network off
+the container has no network (--network none), ports cannot be published and the image
+must already be local.
 
 | Parameter | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |

@@ -82,7 +82,8 @@ A URL that stays the same needs your own tunnel or reverse proxy with a fixed ho
 
 ## Stopping and troubleshooting
 
-`dev-link stop DIR` stops the server and the tunnel.
+`dev-link stop DIR` stops the server and the tunnel. If cloudflared exits on its own, the server
+stops too, and `dev-link logs server DIR` shows why.
 
 Cloudflare gives quick tunnels no uptime guarantee and allows up to 200 requests in flight per
 tunnel. They suit a working session, not a server that stays up.

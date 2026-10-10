@@ -17,7 +17,6 @@ import base64
 import contextlib
 import difflib
 import functools
-import ipaddress
 import itertools
 import json
 import logging
@@ -36,7 +35,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from dev_link_mcp.runtime import Runtime
 from dev_link_mcp.tools.base import ToolGroup
-from dev_link_mcp.tools.common import NETWORK_OFF_REFUSED_HINT, OPEN_WORLD, READ_ONLY, WRITE, clip
+from dev_link_mcp.tools.common import OPEN_WORLD, READ_ONLY, WRITE, clip
 
 if TYPE_CHECKING:
     from playwright.async_api import Browser, BrowserContext, Page, Playwright, Request, Response, ViewportSize
@@ -61,6 +60,14 @@ TITLE_TIMEOUT_S = 5.0
 MAX_INLINE_IMAGE_BYTES = 5_000_000
 # Page ids remembered after an idle close; older ones get the generic "no open page" error.
 MAX_IDLE_CLOSED_IDS = 100
+# With the network off, WebRTC would send UDP (STUN, TURN, peer traffic) from Chromium itself, past the
+# refusing proxy and the routes. This policy limits WebRTC to the proxy, which refuses everything.
+OFFLINE_LAUNCH_ARGS = ["--force-webrtc-ip-handling-policy=disable_non_proxied_udp"]
+# Also hide the APIs so pages fail fast instead of waiting on connections that never come. WebTransport
+# only exists on secure origins, which network-off pages never load; it is removed in case that changes.
+OFFLINE_INIT_SCRIPT = """for (const name of ["RTCPeerConnection", "webkitRTCPeerConnection", "WebTransport"]) {
+  delete globalThis[name];
+}"""
 
 LoadState = Literal["load", "domcontentloaded", "networkidle"]
 WaitUntil = Literal["load", "domcontentloaded", "networkidle", "commit"]
@@ -107,11 +114,13 @@ class _BrowserHost:
     """One server's Playwright driver, Chromium instance and page registry.
 
     With `idle_timeout_s` > 0 the driver and browser are closed once no browser tool call has run
-    for that long, and start again on the next call.
+    for that long, and start again on the next call. `network` is the server's sandbox.network
+    setting, fixed for the server's lifetime; when False Chromium launches with OFFLINE_LAUNCH_ARGS.
     """
 
-    def __init__(self, headless: bool, idle_timeout_s: float = 0) -> None:
+    def __init__(self, headless: bool, idle_timeout_s: float = 0, *, network: bool) -> None:
         self.headless = headless
+        self.network = network
         self.idle_timeout_s = idle_timeout_s
         self.playwright: Playwright | None = None
         self.browser: Browser | None = None
@@ -179,7 +188,7 @@ class _BrowserHost:
                 self.idle_task = None
 
     def sink_proxy(self) -> str:
-        """Proxy URL that refuses every connection, used to cut off non-loopback traffic.
+        """Proxy URL that refuses every connection, used to cut off all traffic when the network is off.
 
         The port is bound but never listened on, so nothing else on the host can take it
         over and act as a real proxy.
@@ -230,7 +239,9 @@ class _BrowserHost:
                 except Exception as exc:
                     raise ToolError(f"Playwright could not start: {_first_line(exc)}. {INSTALL_HINT}") from exc
             try:
-                self.browser = await self.playwright.chromium.launch(headless=self.headless)
+                self.browser = await self.playwright.chromium.launch(
+                    headless=self.headless, args=[] if self.network else OFFLINE_LAUNCH_ARGS
+                )
             except Exception as exc:
                 raise ToolError(f"Chromium could not launch: {_first_line(exc)}. {INSTALL_HINT}") from exc
             return self.browser
@@ -343,24 +354,9 @@ def _playwright_error(action: str, exc: Exception) -> ToolError:
     return ToolError(f"{action} failed: {clip(message, 2000)}")
 
 
-def _is_loopback_host(host: str) -> bool:
-    host = host.lower().rstrip(".").strip("[]")
-    if host == "localhost" or host.endswith(".localhost"):
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
-
-
-def _network_allowed(rt: Runtime, url: str) -> bool:
-    """Whether the browser may load `url` under the server's network setting."""
-    if rt.config.sandbox.network:
-        return True
-    parts = urlsplit(url)
-    if parts.scheme in ("data", "blob", "about"):
-        return True
-    return _is_loopback_host(parts.hostname or "")
+def _offline_allowed(url: str) -> bool:
+    """Whether a page may load `url` with the network off: only in-browser data, never the host's loopback."""
+    return urlsplit(url).scheme in ("data", "blob", "about")
 
 
 def _check_url(rt: Runtime, url: str) -> str:
@@ -368,6 +364,12 @@ def _check_url(rt: Runtime, url: str) -> str:
     url = url.strip()
     if url == "about:blank":
         return url
+    # Checked first so a file:// URL does not get advice to open a loopback URL that is refused too.
+    if not rt.config.sandbox.network:
+        raise ToolError(
+            "network access is off on this server, so the browser can only open about:blank; ask the user to"
+            " restart the server with network access"
+        )
     parts = urlsplit(url)
     if parts.scheme == "file":
         raise ToolError(
@@ -376,10 +378,6 @@ def _check_url(rt: Runtime, url: str) -> str:
         )
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise ToolError(f"URL must be http(s)://host/... or about:blank, got {url!r}")
-    if not _network_allowed(rt, url):
-        raise ToolError(
-            f"network access is disabled on this server; only loopback URLs are allowed, not {parts.hostname}"
-        )
     return url
 
 
@@ -462,8 +460,8 @@ async def _new_context(
     options["accept_downloads"] = False
     if not rt.config.sandbox.network:
         # Routes do not see redirect hops, service worker fetches or prefetches, so a proxy that
-        # refuses connections backs them up for everything except loopback.
-        options["proxy"] = {"server": host.sink_proxy(), "bypass": "localhost,*.localhost,127.0.0.0/8,[::1]"}
+        # refuses connections backs them up. With no bypass list Playwright proxies loopback too.
+        options["proxy"] = {"server": host.sink_proxy()}
     context = await browser.new_context(**options)
     try:
         await _guard_context(rt, context, default_timeout_s)
@@ -487,13 +485,14 @@ async def _guard_context(rt: Runtime, context: BrowserContext, default_timeout_s
             await route.abort("blockedbyclient")
 
         async def block_ws(ws: Any) -> None:
-            await ws.close(code=1008, reason="network access is disabled on this server")
+            await ws.close(code=1008, reason="network access is off on this server")
 
         def denied(url: str) -> bool:
-            return not _network_allowed(rt, url)
+            return not _offline_allowed(url)
 
         await context.route(denied, block)
         await context.route_web_socket(denied, block_ws)
+        await context.add_init_script(OFFLINE_INIT_SCRIPT)
 
 
 async def _title(page: Page) -> str:
@@ -541,10 +540,7 @@ async def _goto(rt: Runtime, state: _PageState, url: str, wait_until: WaitUntil,
     try:
         response = await state.page.goto(url, wait_until=wait_until, timeout=_timeout_ms(rt, timeout_s))
     except Exception as exc:
-        error = _playwright_error(f"navigating to {url}", exc)
-        if not rt.config.sandbox.network and "ERR_CONNECTION_REFUSED" in str(exc):
-            error = ToolError(f"{error}\n{NETWORK_OFF_REFUSED_HINT}")
-        raise error from exc
+        raise _playwright_error(f"navigating to {url}", exc) from exc
     return response.status if response is not None else None
 
 
@@ -1088,7 +1084,11 @@ class BrowserGroup(ToolGroup):
 
     def __init__(self, rt: Runtime, settings: BaseModel) -> None:
         super().__init__(rt, settings)
-        self.host = _BrowserHost(headless=self.settings.headless, idle_timeout_s=self.settings.idle_timeout_s)
+        self.host = _BrowserHost(
+            headless=self.settings.headless,
+            idle_timeout_s=self.settings.idle_timeout_s,
+            network=rt.config.sandbox.network,
+        )
 
     def register(self, mcp: MCPServer) -> None:
         _register(mcp, self.rt, self.settings, self.host)

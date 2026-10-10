@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import json
 import socket
 import threading
 import time
@@ -51,6 +52,7 @@ class _Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        self.server.hits.append(self.path)
         parts = urlsplit(self.path)
         pages = {"/": INDEX, "/next": NEXT, "/late": LATE, "/external": EXTERNAL, "/throws": THROWS}
         pages["/chatty"] = CHATTY
@@ -78,13 +80,29 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
+class _Server(ThreadingHTTPServer):
+    daemon_threads = True
+    # Request paths seen, so a test can prove a blocked request never reached the server.
+    hits: list[str]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.hits = []
+
+
 @pytest.fixture(scope="module")
-def site() -> Iterator[str]:
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+def site_server() -> Iterator[_Server]:
+    server = _Server(("127.0.0.1", 0), _Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    yield f"http://127.0.0.1:{server.server_address[1]}"
+    yield server
     server.shutdown()
+    server.server_close()
+
+
+@pytest.fixture(scope="module")
+def site(site_server: _Server) -> str:
+    return f"http://127.0.0.1:{site_server.server_address[1]}"
 
 
 async def open_page(client, url, **kwargs) -> dict:
@@ -327,31 +345,168 @@ async def test_rejects_unsupported_urls(connect, site):
         assert r.is_error and "file://" in text(r)
 
 
-async def test_network_disabled_allows_loopback_only(connect, site, rt):
-    rt.config.sandbox.network = False
-    async with connect("browser") as client:
-        r = await client.call_tool("browser_open", {"url": "https://example.com/"})
-        assert r.is_error and "only loopback" in text(r)
-        res = await open_page(client, site + "/external")
-        await call(client, "browser_wait", {"page_id": res["page_id"], "load_state": "networkidle"})
-        failed = (await call(client, "browser_network", {"page_id": res["page_id"]})).structured_content
-        blocked = [x for x in failed["requests"] if "203.0.113.7" in x["url"]]
-        assert blocked and "BLOCKED_BY_CLIENT" in blocked[0]["failure"]
-        localhost = await open_page(client, site.replace("127.0.0.1", "localhost") + "/next")
-        assert localhost["status"] == 200
+NETWORK_OFF = "network access is off on this server"
 
 
-async def test_network_disabled_refused_loopback_explains_namespaces(connect, rt):
+async def test_network_disabled_refuses_every_http_url(connect, site_server, rt):
+    # Chromium runs on the host, so loopback is the host's: its databases, admin UIs and other servers.
     rt.config.sandbox.network = False
-    # Chromium refuses well-known ports such as 1 as unsafe, so use a free high port nobody listens on.
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
+    port = site_server.server_address[1]
+    urls = [
+        "https://example.com/",
+        f"http://127.0.0.1:{port}/next?probe=ip",
+        f"http://localhost:{port}/next?probe=name",
+        f"http://app.localhost:{port}/next?probe=sub",
+        f"http://[::1]:{port}/next?probe=v6",
+        f"http://127.0.0.1:{port}/redirect-out?probe=redirect",
+    ]
     async with connect("browser") as client:
-        r = await client.call_tool("browser_open", {"url": f"http://127.0.0.1:{port}/"})
-        assert r.is_error
-        assert "ERR_CONNECTION_REFUSED" in text(r)
-        assert "own network namespace" in text(r)
+        pid = (await open_page(client, "about:blank"))["page_id"]
+        for url in urls:
+            for tool, args in [
+                ("browser_open", {"url": url}),
+                ("browser_navigate", {"page_id": pid, "url": url}),
+                ("browser_screenshot", {"url": url}),
+            ]:
+                r = await client.call_tool(tool, args)
+                assert r.is_error, (tool, url)
+                assert NETWORK_OFF in text(r), (tool, url)
+    assert not [hit for hit in site_server.hits if "probe=" in hit]
+
+
+async def test_network_disabled_blocks_page_requests_to_loopback(connect, site_server, rt):
+    rt.config.sandbox.network = False
+    port = site_server.server_address[1]
+    script = f"""async () => {{
+        const out = {{}};
+        for (const host of ["127.0.0.1", "localhost", "app.localhost", "[::1]"]) {{
+            try {{ await fetch(`http://${{host}}:{port}/next?probe=fetch-${{host}}`); out[host] = "loaded"; }}
+            catch (e) {{ out[host] = "blocked"; }}
+        }}
+        out.ws = await new Promise((resolve) => {{
+            const ws = new WebSocket("ws://127.0.0.1:{port}/?probe=ws");
+            ws.onopen = () => resolve("open");
+            ws.onclose = () => resolve("closed");
+        }});
+        out.data = await (await fetch("data:text/plain,inline")).text();
+        return out;
+    }}"""
+    async with connect("browser") as client:
+        pid = (await open_page(client, "about:blank"))["page_id"]
+        out = text(await call(client, "browser_eval", {"page_id": pid, "script": script}))
+        # Blocked requests also log console errors after the JSON result.
+        result = json.loads(out.split("\n\nconsole errors", 1)[0])
+        assert result == {
+            "127.0.0.1": "blocked", "localhost": "blocked", "app.localhost": "blocked", "[::1]": "blocked",
+            "ws": "closed", "data": "inline",
+        }  # fmt: skip
+        # A page navigating itself (through a redirect) is blocked as well.
+        await call(
+            client,
+            "browser_eval",
+            {"page_id": pid, "script": f"location.href = 'http://127.0.0.1:{port}/redirect-out?probe=nav'"},
+        )
+        await asyncio.sleep(1)
+    assert not [hit for hit in site_server.hits if "probe=" in hit]
+
+
+async def test_network_disabled_proxy_blocks_loopback_without_routes(rt, site_server):
+    # Routes miss redirect hops, service worker fetches and prefetches; the refusing proxy must
+    # catch loopback too, which Chromium would otherwise bypass.
+    rt.config.sandbox.network = False
+    host = browser._BrowserHost(headless=True, network=False)
+    try:
+        context = await browser._new_context(rt, host, width=800, height=600, device=None, default_timeout_s=10)
+        await context.unroute_all()
+        page = await context.new_page()
+        with pytest.raises(Exception, match="ERR_PROXY_CONNECTION_FAILED"):
+            await page.goto(f"http://127.0.0.1:{site_server.server_address[1]}/next?probe=proxy")
+    finally:
+        await host.shutdown()
+    assert not [hit for hit in site_server.hits if "probe=proxy" in hit]
+
+
+# A WebRTC offer with a STUN server makes Chromium send a UDP binding request straight away.
+STUN_OFFER = """port => {
+    const pc = new RTCPeerConnection({iceServers: [{urls: 'stun:127.0.0.1:' + port}]});
+    pc.createDataChannel('probe');
+    pc.createOffer().then(offer => pc.setLocalDescription(offer));
+    window.probePc = pc;
+    return 'sent';
+}"""
+
+
+@pytest.fixture
+def udp_listener() -> Iterator[socket.socket]:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.setblocking(False)
+    yield sock
+    sock.close()
+
+
+async def _udp_received(sock: socket.socket, wait_s: float) -> bool:
+    deadline = time.monotonic() + wait_s
+    while time.monotonic() < deadline:
+        try:
+            sock.recvfrom(2048)
+            return True
+        except BlockingIOError:
+            await asyncio.sleep(0.05)
+    return False
+
+
+async def test_network_disabled_pages_have_no_webrtc_or_webtransport(connect, rt, udp_listener):
+    # WebRTC sends UDP from Chromium itself, past the refusing proxy and the routes.
+    rt.config.sandbox.network = False
+    port = udp_listener.getsockname()[1]
+    script = f"""async () => {{
+        const names = ['RTCPeerConnection', 'webkitRTCPeerConnection', 'WebTransport'];
+        const frame = document.createElement('iframe');
+        frame.srcdoc = '<p>child</p>';
+        await new Promise(resolve => {{ frame.onload = resolve; document.body.appendChild(frame); }});
+        const offer = ({STUN_OFFER});
+        let attempt;
+        try {{ attempt = offer({port}); }} catch (e) {{ attempt = e.name; }}
+        return {{
+            page: names.filter(n => n in window),
+            frame: names.filter(n => n in frame.contentWindow),
+            attempt,
+        }};
+    }}"""
+    async with connect("browser") as client:
+        pid = (await open_page(client, "about:blank"))["page_id"]
+        out = text(await call(client, "browser_eval", {"page_id": pid, "script": script}))
+        result = json.loads(out.split("\n\nconsole errors", 1)[0])
+        assert result == {"page": [], "frame": [], "attempt": "ReferenceError"}
+        assert not await _udp_received(udp_listener, 2)
+
+
+async def test_network_disabled_browser_sends_no_webrtc_udp_without_the_init_script(udp_listener):
+    # The launch flag must hold on its own: a context without the guard still has RTCPeerConnection.
+    host = browser._BrowserHost(headless=True, network=False)
+    try:
+        chromium = await host.ensure_browser()
+        context = await chromium.new_context(proxy={"server": host.sink_proxy()})
+        page = await context.new_page()
+        assert await page.evaluate(STUN_OFFER, udp_listener.getsockname()[1]) == "sent"
+        assert not await _udp_received(udp_listener, 2)
+    finally:
+        await host.shutdown()
+
+
+async def test_network_enabled_keeps_webrtc(connect, udp_listener):
+    async with connect("browser") as client:
+        pid = (await open_page(client, "about:blank"))["page_id"]
+        script = f"() => ({STUN_OFFER})({udp_listener.getsockname()[1]})"
+        assert text(await call(client, "browser_eval", {"page_id": pid, "script": script})).startswith('"sent"')
+        assert await _udp_received(udp_listener, 5)
+
+
+async def test_network_enabled_loads_loopback(connect, site):
+    async with connect("browser") as client:
+        res = await open_page(client, site + "/next")
+        assert res["status"] == 200 and res["title"] == "Next"
 
 
 async def test_page_limit(connect, site):
@@ -390,17 +545,6 @@ async def test_tools_are_registered_with_annotations(connect):
     assert tools["browser_snapshot"].annotations.read_only_hint is True
     assert tools["browser_click"].annotations.open_world_hint is True
     assert tools["browser_eval"].annotations.destructive_hint is True
-
-
-async def test_network_disabled_blocks_redirect_to_outside(connect, site, rt):
-    # Route handlers only see the first URL of a redirect chain; the hop must still be blocked.
-    rt.config.sandbox.network = False
-    async with connect("browser") as client:
-        await open_page(client, "about:blank")
-        started = time.monotonic()
-        r = await client.call_tool("browser_open", {"url": site + "/redirect-out", "timeout_s": 10})
-        assert r.is_error and "ERR_PROXY_CONNECTION_FAILED" in text(r)
-        assert time.monotonic() - started < 8
 
 
 async def test_eval_times_out_on_a_promise_that_never_settles(connect):

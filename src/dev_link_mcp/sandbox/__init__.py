@@ -23,6 +23,7 @@ from typing import IO
 
 from mcp.server.mcpserver.exceptions import ToolError
 
+from dev_link_mcp import orphans
 from dev_link_mcp.config import Config
 from dev_link_mcp.sandbox.backends import Backend, SandboxUnavailable, select
 from dev_link_mcp.sandbox.limits import ResourceLimits, kill_scope, kill_scope_dir
@@ -307,6 +308,7 @@ class Sandbox:
             )
         except OSError as exc:  # missing program, no permission, argv too long
             raise ToolError(f"cannot start {argv[0]!r}: {exc}") from exc
+        self._watch(proc.pid, scope)
         out, err = Capture(limit), Capture(limit // 4)
         timed_out = False
         try:
@@ -346,10 +348,12 @@ class Sandbox:
         log_file: IO[bytes],
         env: Mapping[str, str] | None = None,
     ) -> asyncio.subprocess.Process:
-        """Start a long-running sandboxed process with stdout and stderr appended to `log_file`.
+        """Start a long-running sandboxed process with stdout and stderr written to `log_file`.
 
-        stdin stays open as a pipe so the caller can send input. The caller owns the
-        process: it stops it with `kill_tree` and, once the process has exited, calls `reap`.
+        `log_file` may be a file or the write end of a pipe; ProcessManager passes a pipe and
+        copies what arrives into the real log, redacted. stdin stays open as a pipe so the
+        caller can send input. The caller owns the process: it stops it with `kill_tree` and,
+        once the process has exited, calls `reap`.
         """
         unit, scope = self._new_scope()
         full, proc_env = self._launch(argv, cwd, env, unit)
@@ -365,12 +369,19 @@ class Sandbox:
             )
         except OSError as exc:  # missing program, no permission, argv too long
             raise ToolError(f"cannot start {argv[0]!r}: {exc}") from exc
+        self._watch(proc.pid, scope)
         self._scopes[proc.pid] = scope
         return proc
 
+    def _watch(self, pid: int, scope: Path | None) -> None:
+        # bubblewrap's --die-with-parent already ends a confined command with the server.
+        if not self.backend.confined:
+            orphans.watch(pid, scope)
+
     def reap(self, pid: int) -> None:
         """SIGKILL whatever a spawned process left behind after it exited: the rest of its
-        process group and everything in its limits scope, including setsid children.
+        process group and everything in its limits scope, including setsid children. Also drops
+        the group from the orphan guard.
 
         Call it right after the process was reaped, so its pid cannot have been reused.
         """
@@ -381,6 +392,7 @@ def _reap(pid: int, scope: Path | None) -> None:
     kill_group_rest(pid)
     if scope is not None:
         kill_scope_dir(scope)
+    orphans.forget(pid)
 
 
 def kill_tree(pid: int, sig: int = signal.SIGKILL) -> None:

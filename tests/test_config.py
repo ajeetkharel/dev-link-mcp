@@ -315,6 +315,13 @@ def test_token_must_be_url_safe(tmp_path, workspace):
     assert cfg.mcp_path == "/mcp"
 
 
+def test_auth_none_drops_a_configured_token(tmp_path, workspace):
+    # A leftover token is not a secret without auth; kept, every log would replace each "e" with ***.
+    cfg = Config(workspace=workspace, state_dir=tmp_path / "s", server={"auth": "none", "token": "e"}).finalize()
+    assert cfg.server.token == ""
+    assert cfg.ui_path == "/ui" and cfg.mcp_path == "/mcp"
+
+
 def test_assignment_is_validated(config):
     with pytest.raises(ValidationError, match="valid boolean"):
         config.sandbox.network = "no"

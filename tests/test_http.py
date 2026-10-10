@@ -44,6 +44,7 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def _route(self):
+        self.server.hits.append(self.path)
         length = int(self.headers.get("Content-Length") or 0)
         data = self.rfile.read(length) if length else b""
         path = self.path
@@ -98,6 +99,12 @@ class _Handler(BaseHTTPRequestHandler):
 
 class _QuietServer(ThreadingHTTPServer):
     daemon_threads = True
+    # Request paths seen, so a test can prove a refused request never reached the server.
+    hits: list[str]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.hits = []
 
     def handle_error(self, request, client_address):
         # Clients that abort mid-body (timeouts, max_bytes) are expected here.
@@ -105,13 +112,18 @@ class _QuietServer(ThreadingHTTPServer):
 
 
 @pytest.fixture(scope="module")
-def server() -> Iterator[str]:
+def httpd() -> Iterator[_QuietServer]:
     httpd = _QuietServer(("127.0.0.1", 0), _Handler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
-    yield f"http://127.0.0.1:{httpd.server_address[1]}"
+    yield httpd
     httpd.shutdown()
     httpd.server_close()
+
+
+@pytest.fixture(scope="module")
+def server(httpd: _QuietServer) -> str:
+    return f"http://127.0.0.1:{httpd.server_address[1]}"
 
 
 # http_request
@@ -283,10 +295,12 @@ async def test_connection_refused(connect):
         r = await client.call_tool("http_request", {"url": "http://127.0.0.1:1/"})
     assert r.is_error
     assert "request failed: ConnectError" in text(r)
-    assert "network namespace" not in text(r)
 
 
 # network off
+
+
+NETWORK_OFF = "network access is off on this server"
 
 
 async def test_network_off_blocks_external_hosts(connect, rt):
@@ -299,88 +313,40 @@ async def test_network_off_blocks_external_hosts(connect, rt):
         ]:
             r = await client.call_tool(tool, args)
             assert r.is_error, tool
-            assert "only loopback URLs are allowed" in text(r)
+            assert NETWORK_OFF in text(r)
+            assert "restart" in text(r)
 
 
-async def test_network_off_allows_loopback(connect, rt, server):
+async def test_network_off_blocks_loopback(connect, rt, httpd, server, workspace):
+    # Requests run in the server process, so loopback here is the host's: its databases and admin UIs.
     rt.config.sandbox.network = False
-    port = server.rsplit(":", 1)[1]
+    port = httpd.server_address[1]
+    urls = [
+        f"{server}/plain?probe=ip",
+        f"http://localhost:{port}/plain?probe=name",
+        f"http://app.localhost:{port}/plain?probe=sub",
+        f"http://[::1]:{port}/plain?probe=v6",
+        f"{server}/redirect?probe=redirect",
+    ]
     async with connect("http") as client:
-        r = await client.call_tool("http_request", {"url": f"{server}/plain"})
-        named = await client.call_tool("http_request", {"url": f"http://localhost:{port}/plain"})
-    assert not r.is_error
-    assert "just text" in text(r)
-    assert not named.is_error
-
-
-def _fake_resolver(monkeypatch, answers: dict[str, list[str]]) -> None:
-    """Make getaddrinfo return the given addresses for the given names; other names resolve normally."""
-    import socket
-
-    real = socket.getaddrinfo
-
-    def fake(host, port, *args, **kwargs):
-        if host in answers:
-            family = {4: socket.AF_INET, 6: socket.AF_INET6}
-            return [
-                (family[ip_version(a)], socket.SOCK_STREAM, 6, "", (a, port) if ":" not in a else (a, port, 0, 0))
-                for a in answers[host]
-            ]
-        return real(host, port, *args, **kwargs)
-
-    def ip_version(address: str) -> int:
-        return 6 if ":" in address else 4
-
-    monkeypatch.setattr(socket, "getaddrinfo", fake)
-
-
-async def test_network_off_localhost_subdomain_resolving_public_is_blocked(connect, rt, monkeypatch):
-    # Without nss-myhostname a *.localhost name can go to DNS and come back with any address.
-    rt.config.sandbox.network = False
-    _fake_resolver(monkeypatch, {"evil.localhost": ["169.254.169.254"], "mixed.localhost": ["127.0.0.1", "10.0.0.1"]})
-    async with connect("http") as client:
-        evil = await client.call_tool("http_request", {"url": "http://evil.localhost/latest/meta-data/"})
-        mixed = await client.call_tool("fetch_url", {"url": "http://mixed.localhost/"})
-    assert evil.is_error
-    assert "169.254.169.254" in text(evil)
-    assert "not only loopback" in text(evil)
-    assert mixed.is_error
-    assert "not only loopback" in text(mixed)
-
-
-async def test_network_off_localhost_subdomain_pinned_to_loopback(connect, rt, server, monkeypatch):
-    # ::1 is tried first and refused (the test server is IPv4 only), then 127.0.0.1 answers.
-    rt.config.sandbox.network = False
-    _fake_resolver(monkeypatch, {"app.localhost": ["::1", "127.0.0.1"]})
-    port = server.rsplit(":", 1)[1]
-    async with connect("http") as client:
-        r = await client.call_tool("http_request", {"url": f"http://app.localhost:{port}/echo"})
-    assert not r.is_error, text(r)
-    assert f'"host": "app.localhost:{port}"' in text(r)
-
-
-async def test_network_off_refused_loopback_explains_namespaces(connect, rt):
-    # Sandboxed servers live in their own network namespace when the network is off, so a refused
-    # loopback connection usually means the agent is trying to reach one of them.
-    rt.config.sandbox.network = False
-    async with connect("http") as client:
-        r = await client.call_tool("http_request", {"url": "http://127.0.0.1:1/"})
-        d = await client.call_tool("download_file", {"url": "http://127.0.0.1:1/a", "path": "a"})
-    for result in (r, d):
-        assert result.is_error
-        assert "ConnectError" in text(result)
-        assert "own network namespace" in text(result)
-
-
-async def test_network_off_blocks_redirect_to_external(connect, rt, server, workspace):
-    rt.config.sandbox.network = False
-    async with connect("http") as client:
-        r = await client.call_tool("http_request", {"url": f"{server}/redirect-external"})
-        d = await client.call_tool("download_file", {"url": f"{server}/redirect-external", "path": "out.bin"})
-    assert r.is_error
-    assert "203.0.113.9" in text(r)
-    assert d.is_error
+        for url in urls:
+            for tool, args in [
+                ("http_request", {"url": url}),
+                ("fetch_url", {"url": url}),
+                ("download_file", {"url": url, "path": "out.txt"}),
+            ]:
+                r = await client.call_tool(tool, args)
+                assert r.is_error, (tool, url)
+                assert NETWORK_OFF in text(r), (tool, url)
+    assert not [hit for hit in httpd.hits if "probe=" in hit]
     assert list(workspace.iterdir()) == []
+
+
+async def test_network_on_still_reaches_loopback(connect, server):
+    async with connect("http") as client:
+        r = await client.call_tool("http_request", {"url": f"{server}/redirect"})
+    assert not r.is_error, text(r)
+    assert "just text" in text(r)
 
 
 # fetch_url

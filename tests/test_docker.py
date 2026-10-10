@@ -1,13 +1,16 @@
+import ipaddress
 import json
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 from pathlib import Path
 
 import pytest
 from conftest import DOCKER_IMAGE, text
 
+from dev_link_mcp.sandbox import RunResult
 from dev_link_mcp.tools import docker as docker_mod
 
 IMAGE = DOCKER_IMAGE
@@ -627,6 +630,22 @@ def test_compose_violations_flags_host_reaching_keys(workspace):
     assert f"{root}/cache" not in problems
 
 
+@pytest.mark.parametrize("kind", ["nfs", "nfs4", "cifs", "overlay", "ext4"])
+def test_compose_violations_refuses_volume_mount_types(workspace, kind):
+    # The daemon mounts these as root on the host: network shares, or host paths named in `o`.
+    root = workspace.resolve()
+    opts = {"type": kind, "o": "addr=127.0.0.1,ro", "device": str(root / "data")}
+    problems = docker_mod.compose_violations({"volumes": {"share": {"driver_opts": opts}}}, root)
+    assert problems == [f"volume 'share': driver_opts type {kind!r} is not allowed (only none, bind, tmpfs)"]
+
+
+@pytest.mark.parametrize("opts", [{"type": "none", "o": "bind"}, {"type": "bind"}, {"type": "tmpfs"}, {"o": "bind"}])
+def test_compose_violations_accepts_local_volume_types(workspace, opts):
+    root = workspace.resolve()
+    volume = {"driver_opts": {**opts, "device": str(root / "data")}}
+    assert docker_mod.compose_violations({"volumes": {"v": volume}}, root) == []
+
+
 @pytest.mark.docker
 async def test_compose_typical_file_passes_check(connect, workspace):
     """A realistic dev stack must not trip the allowlist after compose normalizes it."""
@@ -749,5 +768,313 @@ async def test_compose_action_uses_the_checked_env_file(connect, workspace, monk
         env = sh("inspect", f"{project}-app-1", "--format", "{{json .Config.Env}}")
         assert "V=checked" in env.stdout
         assert "V=swapped" not in env.stdout
+    finally:
+        sh("compose", "-p", project, "down", "--remove-orphans")
+
+
+# --- with the network off ------------------------------------------------------------------
+
+
+def test_offline_compose_makes_networks_internal_and_stops_pulls():
+    config = {
+        "name": "p",
+        "services": {
+            "web": {"image": "nginx", "networks": {"default": None, "back": None}},
+            "db": {"image": "postgres", "networks": {"back": None}, "pull_policy": "missing"},
+            "side": {"image": "busybox", "network_mode": "service:web"},
+            "solo": {"image": "busybox", "network_mode": "none"},
+        },
+        "networks": {"default": {"name": "p_default"}, "back": {"name": "p_back", "driver": "bridge"}},
+    }
+    rewritten, problems = docker_mod.offline_compose(config)
+    assert problems == []
+    isolated = {
+        "com.docker.network.bridge.gateway_mode_ipv4": "isolated",
+        "com.docker.network.bridge.gateway_mode_ipv6": "isolated",
+    }
+    for net in rewritten["networks"].values():
+        assert net["internal"] is True
+        assert net["driver_opts"] == isolated
+    assert rewritten["services"]["web"]["pull_policy"] == "never"
+    assert rewritten["services"]["db"]["pull_policy"] == "never"
+    assert "internal" not in config["networks"]["default"]
+
+
+def test_offline_compose_refuses_what_reaches_the_network():
+    config = {
+        "services": {
+            "pub": {"image": "nginx", "ports": [{"target": 80, "published": "8080"}]},
+            "bridge": {"image": "busybox", "network_mode": "bridge"},
+            "orphan": {"image": "busybox", "network_mode": "service:nope"},
+            "always": {"image": "busybox", "pull_policy": "always"},
+            "gelf": {"image": "busybox", "logging": {"driver": "gelf"}},
+            "b": {"image": "b", "build": {"context": "/ws"}},
+        },
+        "networks": {
+            "ext": {"name": "ext", "external": True},
+            "mac": {"name": "mac", "driver": "macvlan"},
+            "opts": {"name": "opts", "driver_opts": {"com.docker.network.bridge.name": "docker0"}},
+        },
+    }
+    _, problems = docker_mod.offline_compose(config)
+    joined = "\n".join(problems)
+    for expected in (
+        "'pub': ports",
+        "network_mode: bridge",
+        "network_mode: service:nope",
+        "pull_policy always",
+        "logging driver gelf",
+        "'b' has build: the server's network is off, so images cannot be built",
+        "network 'ext': external",
+        "network 'mac': driver macvlan",
+        "network 'opts': driver_opts",
+    ):
+        assert expected in joined, expected
+
+
+async def test_run_refuses_ports_with_network_off(connect, rt):
+    rt.config.sandbox.network = False
+    async with connect("docker") as client:
+        result = await client.call_tool("docker_run", {"image": IMAGE, "ports": ["8080:80"]})
+    assert result.is_error
+    assert "network is off" in text(result)
+
+
+def _probe(target: str) -> str:
+    # Prints which of the outside world the container can reach; busybox has wget and nslookup.
+    return (
+        f"wget -T 3 -q -O /dev/null http://{target}/ && echo REACHED || echo NO-REACH;"
+        " nslookup -timeout=2 example.com >/dev/null 2>&1 && echo RESOLVED || echo NO-DNS"
+    )
+
+
+@pytest.mark.docker
+async def test_run_with_network_off_has_no_network(connect, rt, cleanup):
+    rt.config.sandbox.network = False
+    async with connect("docker") as client:
+        run = await client.call_tool(
+            "docker_run", {"image": IMAGE, "command": ["sh", "-c", _probe("1.1.1.1")], "detach": False}
+        )
+        assert not run.is_error, text(run)
+        assert "NO-REACH" in text(run) and "NO-DNS" in text(run)
+        detached = await client.call_tool("docker_run", {"image": IMAGE, "command": ["sleep", "300"]})
+        assert not detached.is_error, text(detached)
+        cid = text(detached).split()[2]
+        assert sh("inspect", "--format", "{{.HostConfig.NetworkMode}}", cid).stdout.strip() == "none"
+        missing = await client.call_tool("docker_run", {"image": "dev-link-missing:none"})
+    assert missing.is_error
+    assert "must already exist locally" in text(missing)
+
+
+async def test_build_is_refused_with_network_off(connect, workspace, rt):
+    rt.config.sandbox.network = False
+    (workspace / "Dockerfile").write_text(f"FROM {IMAGE}\n")
+    async with connect("docker") as client:
+        result = await client.call_tool("docker_build", {"tag": "x:y"})
+    assert result.is_error
+    assert "images cannot be built" in text(result)
+
+
+@pytest.mark.docker
+async def test_compose_with_network_off(connect, workspace, rt, cleanup):
+    rt.config.sandbox.network = False
+    project = f"dev-link-test-{secrets.token_hex(3)}"
+    (workspace / "compose.yaml").write_text(
+        f"name: {project}\n"
+        "services:\n"
+        "  web:\n"
+        f"    image: {IMAGE}\n"
+        "    command: [sh, -c, 'echo hello > /index.html; httpd -f -p 8080 -h /']\n"
+        "  probe:\n"
+        f"    image: {IMAGE}\n"
+        "    command: [sleep, '300']\n"
+    )
+    try:
+        async with connect("docker") as client:
+            up = await client.call_tool("compose", {"action": "up"})
+            assert not up.is_error, text(up)
+            inside = await client.call_tool(
+                "docker_exec",
+                {"container": f"{project}-probe-1", "command": "wget -T 3 -q -O- http://web:8080/"},
+            )
+            assert "hello" in text(inside)
+            outside = await client.call_tool(
+                "docker_exec", {"container": f"{project}-probe-1", "command": _probe("1.1.1.1")}
+            )
+            assert "NO-REACH" in text(outside) and "NO-DNS" in text(outside)
+            # Restarting a project is fine while it stays on its internal networks.
+            restart = await client.call_tool("compose", {"action": "restart"})
+            assert not restart.is_error, text(restart)
+            (workspace / "compose.yaml").write_text(
+                f"name: {project}\nservices:\n  web:\n    image: {IMAGE}\n    ports: ['8080']\n"
+            )
+            ports = await client.call_tool("compose", {"action": "up"})
+            assert ports.is_error and "ports cannot be published" in text(ports)
+            (workspace / "Dockerfile").write_text(f"FROM {IMAGE}\n")
+            (workspace / "compose.yaml").write_text(f"name: {project}\nservices:\n  app:\n    build: .\n")
+            for action in ("up", "restart", "build"):
+                built = await client.call_tool("compose", {"action": action})
+                assert built.is_error and "images cannot be built" in text(built), action
+            down = await client.call_tool("compose", {"action": "down"})
+            assert not down.is_error, text(down)
+    finally:
+        sh("compose", "-p", project, "down", "--remove-orphans")
+
+
+@pytest.mark.docker
+async def test_network_off_refuses_containers_started_with_network(connect, workspace, rt, cleanup):
+    project = f"dev-link-test-{secrets.token_hex(3)}"
+    (workspace / "compose.yaml").write_text(
+        f"name: {project}\nservices:\n  app:\n    image: {IMAGE}\n    command: [sleep, '300']\n"
+    )
+    other = f"dev-link-test-{secrets.token_hex(3)}"
+    label = f"dev-link.workspace={workspace.resolve()}"
+    # Started from this workspace by an earlier server that had the network on.
+    assert sh("run", "-d", "--label", label, "--name", other, IMAGE, "sleep", "300").returncode == 0
+    assert sh("compose", "-f", str(workspace / "compose.yaml"), "up", "-d").returncode == 0
+    try:
+        rt.config.sandbox.network = False
+        async with connect("docker") as client:
+            exec_run = await client.call_tool("docker_exec", {"container": other, "command": "true"})
+            assert exec_run.is_error and "has network access" in text(exec_run)
+            for action in ("restart", "up"):
+                result = await client.call_tool("compose", {"action": action})
+                assert result.is_error, action
+                assert "compose down first" in text(result)
+            down = await client.call_tool("compose", {"action": "down"})
+            assert not down.is_error, text(down)
+            up = await client.call_tool("compose", {"action": "up"})
+            assert not up.is_error, text(up)
+            exec_ok = await client.call_tool("docker_exec", {"container": f"{project}-app-1", "command": "true"})
+            assert not exec_ok.is_error, text(exec_ok)
+    finally:
+        sh("compose", "-p", project, "down", "--remove-orphans")
+
+
+def _compose_file(workspace: Path, project: str, extra: str = "") -> None:
+    """Write a compose file with a sleeping `probe` service; `extra` goes at the end, so indented lines
+    extend that service."""
+    (workspace / "compose.yaml").write_text(
+        f"name: {project}\nservices:\n  probe:\n    image: {IMAGE}\n    command: [sleep, '300']\n{extra}"
+    )
+
+
+@pytest.mark.docker
+async def test_compose_with_network_off_cannot_reach_the_host(connect, workspace, rt, cleanup):
+    rt.config.sandbox.network = False
+    project = f"dev-link-test-{secrets.token_hex(3)}"
+    _compose_file(workspace, project)
+    try:
+        async with connect("docker") as client:
+            up = await client.call_tool("compose", {"action": "up"})
+            assert not up.is_error, text(up)
+            subnet = sh("network", "inspect", "--format", "{{(index .IPAM.Config 0).Subnet}}", f"{project}_default")
+            gateway = next(ipaddress.ip_network(subnet.stdout.strip()).hosts())
+            # A host service listening on every address, like a dev database on *:3306.
+            with socket.create_server(("0.0.0.0", 0)) as server:
+                port = server.getsockname()[1]
+                probe = await client.call_tool(
+                    "docker_exec",
+                    {
+                        "container": f"{project}-probe-1",
+                        "command": f"nc -w 3 {gateway} {port} </dev/null && echo REACHED || echo NO-REACH",
+                    },
+                )
+        assert "NO-REACH" in text(probe), text(probe)
+    finally:
+        sh("compose", "-p", project, "down", "--remove-orphans")
+
+
+@pytest.mark.docker
+async def test_compose_with_network_off_needs_local_image_volumes(connect, workspace, rt, cleanup):
+    rt.config.sandbox.network = False
+    project = f"dev-link-test-{secrets.token_hex(3)}"
+    mount = "    volumes:\n      - type: image\n        source: {}\n        target: /img\n"
+    try:
+        async with connect("docker") as client:
+            # The daemon pulls image volume sources even with pull_policy never.
+            _compose_file(workspace, project, mount.format("dev-link-missing:none"))
+            missing = await client.call_tool("compose", {"action": "up"})
+            assert missing.is_error
+            assert "image volume dev-link-missing:none is not available locally" in text(missing)
+            _compose_file(workspace, project, mount.format(IMAGE))
+            up = await client.call_tool("compose", {"action": "up"})
+            assert not up.is_error, text(up)
+            listed = await client.call_tool(
+                "docker_exec", {"container": f"{project}-probe-1", "command": "test -x /img/bin/sh && echo MOUNTED"}
+            )
+            assert "MOUNTED" in text(listed), text(listed)
+    finally:
+        sh("compose", "-p", project, "down", "--remove-orphans")
+
+
+@pytest.mark.docker
+async def test_network_off_refuses_internal_networks_without_isolation(connect, workspace, rt, cleanup):
+    project = f"dev-link-test-{secrets.token_hex(3)}"
+    # Internal but created without isolated gateways: the host still has an address on it.
+    _compose_file(workspace, project, "networks:\n  default:\n    internal: true\n")
+    assert sh("compose", "-f", str(workspace / "compose.yaml"), "up", "-d").returncode == 0
+    try:
+        rt.config.sandbox.network = False
+        async with connect("docker") as client:
+            for action in ("up", "restart"):
+                result = await client.call_tool("compose", {"action": action})
+                assert result.is_error, action
+                assert f"network {project}_default of project" in text(result)
+                assert "compose down first" in text(result)
+            exec_run = await client.call_tool("docker_exec", {"container": f"{project}-probe-1", "command": "true"})
+            assert exec_run.is_error and "has network access" in text(exec_run)
+    finally:
+        sh("compose", "-p", project, "down", "--remove-orphans")
+
+
+def _fake_docker(monkeypatch, prefix: list[str], fake: RunResult) -> None:
+    """Answer docker commands starting with `prefix` with `fake`; the rest run for real."""
+    real = docker_mod.run_docker
+
+    async def run(args, **kwargs):
+        if list(args[: len(prefix)]) == prefix:
+            return fake
+        return await real(args, **kwargs)
+
+    monkeypatch.setattr(docker_mod, "run_docker", run)
+
+
+@pytest.mark.docker
+async def test_network_off_compose_needs_docker_28(connect, workspace, rt, monkeypatch, cleanup):
+    rt.config.sandbox.network = False
+    project = f"dev-link-test-{secrets.token_hex(3)}"
+    _compose_file(workspace, project)
+    _fake_docker(monkeypatch, ["version"], RunResult(0, "27.5.1\n", "", 0.1, False, False))
+    try:
+        async with connect("docker") as client:
+            result = await client.call_tool("compose", {"action": "up"})
+        assert result.is_error
+        assert "Docker 27.5.1 cannot isolate internal networks from the host; it needs Docker 28" in text(result)
+    finally:
+        sh("compose", "-p", project, "down", "--remove-orphans")
+
+
+@pytest.mark.docker
+@pytest.mark.parametrize(
+    "fake",
+    [
+        RunResult(1, "", "Error response from daemon: permission denied\n", 0.1, False, False),
+        RunResult(None, "", "", 30.0, True, False),
+    ],
+)
+async def test_network_off_compose_fails_closed_when_networks_cannot_be_inspected(
+    connect, workspace, rt, monkeypatch, cleanup, fake
+):
+    rt.config.sandbox.network = False
+    project = f"dev-link-test-{secrets.token_hex(3)}"
+    _compose_file(workspace, project)
+    _fake_docker(monkeypatch, ["network", "inspect"], fake)
+    try:
+        async with connect("docker") as client:
+            result = await client.call_tool("compose", {"action": "up"})
+        assert result.is_error
+        assert "docker network inspect failed" in text(result)
+        assert sh("ps", "-aq", "--filter", f"label=com.docker.compose.project={project}").stdout.strip() == ""
     finally:
         sh("compose", "-p", project, "down", "--remove-orphans")

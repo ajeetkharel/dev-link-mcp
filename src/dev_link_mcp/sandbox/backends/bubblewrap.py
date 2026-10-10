@@ -8,6 +8,7 @@ under the state dir, and paths match host paths so tool output stays meaningful 
 from __future__ import annotations
 
 import functools
+import logging
 import os
 import shutil
 import subprocess
@@ -16,6 +17,8 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from dev_link_mcp.config import Config
+
+log = logging.getLogger(__name__)
 
 _SYSTEM_RO = ("/usr", "/etc", "/opt", "/srv")
 _SYSTEM_LINKS = ("/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32")
@@ -60,6 +63,8 @@ class Bubblewrap:
         self.tmp = tmp
         self.real_home = Path.home()
         self.bwrap = shutil.which("bwrap")
+        # Paths already reported as skipped, so a command loop does not repeat the warning.
+        self._skipped: set[Path] = set()
 
     def available(self) -> str | None:
         if not sys.platform.startswith("linux"):
@@ -72,17 +77,107 @@ class Bubblewrap:
         return None
 
     def ro_paths(self) -> list[Path]:
-        """Configured read-only paths that exist, resolved."""
+        """Configured read-only paths that exist and keep clear of the state dir, resolved."""
+        return self._mountable(self.config.sandbox.ro_paths, "sandbox.ro_paths entry")
+
+    def rw_paths(self) -> list[Path]:
+        """Configured read-write paths that exist and keep clear of the state dir, resolved."""
+        return self._mountable(self.config.sandbox.rw_paths, "sandbox.rw_paths entry")
+
+    def _mountable(self, raws: Sequence[str], source: str) -> list[Path]:
+        """The entries of `raws` that exist, resolved, minus those that would mount the state dir.
+
+        Resolved again for every command: an entry that did not exist at startup can since have
+        been created inside a writable mount as a symlink to the state dir, which exposed_state()
+        could not see. Such an entry is left out and logged once.
+        """
         paths = []
-        for raw in self.config.sandbox.ro_paths:
+        for raw in raws:
             p = Path(raw).expanduser()
-            if p.exists():
-                paths.append(p.resolve())
+            if not p.exists():
+                continue
+            root = p.resolve()
+            if self._state_overlap(root) is None:
+                paths.append(root)
+            elif root not in self._skipped:
+                self._skipped.add(root)
+                log.warning("not mounting %s %s: it resolves to %s, which overlaps state_dir", source, raw, root)
         return paths
 
+    def _state_overlap(self, root: Path) -> str | None:
+        """How mounting the resolved path `root` would expose the state dir, or None when it would not.
+
+        "contains" when the state dir is inside `root`, "inside" when `root` is inside the state
+        dir. Mounts inside its `home` and `tmp` do not count: those are the agent's own.
+        """
+        if self.config.state_dir is None:
+            return None
+        state = self.config.state_dir.resolve()
+        if state.is_relative_to(root):
+            return "contains"
+        own = (self.home.resolve(), self.tmp.resolve())
+        if root.is_relative_to(state) and not any(root.is_relative_to(p) for p in own):
+            return "inside"
+        return None
+
+    def exposed_state(self) -> str | None:
+        """None when commands cannot see the state dir, else a one-line reason naming the mount.
+
+        The state dir holds the audit log, process logs and the connection file with the token,
+        so a mount that contains it or lies inside it would let the agent read them (or rewrite
+        them, for a read-write mount). Its `home` and `tmp` are the agent's own and are meant to
+        be mounted; a mount inside them exposes nothing else. Configured paths count whether or
+        not they exist yet, because `wrap` mounts them as soon as they do.
+        """
+        state = self.config.state_dir
+        if state is None:
+            return None
+        state = state.resolve()
+        mounts = [(Path(p), "built-in system mount") for p in (*_SYSTEM_RO, *_SYSTEM_LINKS, "/etc/resolv.conf")]
+        mounts += [(Path(raw).expanduser(), "sandbox.ro_paths entry") for raw in self.config.sandbox.ro_paths]
+        mounts += [(Path(raw).expanduser(), "sandbox.rw_paths entry") for raw in self.config.sandbox.rw_paths]
+        mounts.append((self.config.workspace, "workspace"))
+        for path, source in mounts:
+            root = path.resolve()
+            overlap = self._state_overlap(root)
+            if overlap is None:
+                continue
+            if overlap == "contains":
+                where = f"state_dir {state} is inside {source} {root}"
+            else:
+                where = f"{source} {root} is inside state_dir {state}"
+            return (
+                f"{where}, so sandboxed commands could read the audit log and the connection token; "
+                "set state_dir (--state-dir) to a folder the sandbox does not mount, or change that setting"
+            )
+        return None
+
+    def replaceable_mount(self) -> str | None:
+        """None when the agent cannot change any configured mount source, else a one-line reason.
+
+        The agent writes the workspace, every rw_paths entry and its private home and tmp. A
+        ro_paths or rw_paths entry inside (or equal to) one of them could be swapped for a
+        symlink between the check in wrap() and the mount bwrap then makes, mounting whatever
+        it points to. Paths are compared after expanduser and resolve, existing or not.
+        """
+        ro = [(Path(raw).expanduser(), "sandbox.ro_paths entry") for raw in self.config.sandbox.ro_paths]
+        rw = [(Path(raw).expanduser(), "sandbox.rw_paths entry") for raw in self.config.sandbox.rw_paths]
+        own = [(self.config.workspace, "workspace"), (self.home, "private home"), (self.tmp, "private tmp")]
+        for entry in ro + rw:
+            path, source = entry
+            root = path.resolve()
+            for mount in own + rw:
+                if mount is entry or not root.is_relative_to(mount[0].resolve()):
+                    continue
+                return (
+                    f"{source} {path} is inside the writable mount {mount[1]} {mount[0].resolve()}, so a sandboxed "
+                    "command could replace it with a symlink to any host path; remove that entry or move it out of "
+                    "the writable mount"
+                )
+        return None
+
     def visible(self, path: Path) -> bool:
-        roots = [Path(p) for p in _SYSTEM_RO] + self.ro_paths() + [self.config.workspace]
-        roots += [Path(p).expanduser().resolve() for p in self.config.sandbox.rw_paths]
+        roots = [Path(p) for p in _SYSTEM_RO] + self.ro_paths() + self.rw_paths() + [self.config.workspace]
         resolved = path.resolve()
         return any(resolved.is_relative_to(root) for root in roots)
 
@@ -118,10 +213,8 @@ class Bubblewrap:
         args += ["--bind", str(self.home), str(self.real_home)]
         for p in self.ro_paths():
             args += ["--ro-bind", str(p), str(p)]
-        for raw in self.config.sandbox.rw_paths:
-            p = Path(raw).expanduser().resolve()
-            if p.exists():
-                args += ["--bind", str(p), str(p)]
+        for p in self.rw_paths():
+            args += ["--bind", str(p), str(p)]
         args += ["--bind", str(self.config.workspace), str(self.config.workspace)]
         for name, value in extra_env.items():
             args += ["--setenv", name, value]

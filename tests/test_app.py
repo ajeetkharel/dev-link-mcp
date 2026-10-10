@@ -19,7 +19,7 @@ from pydantic import BaseModel
 
 import dev_link_mcp.middleware as middleware
 import dev_link_mcp.tools as tools
-from dev_link_mcp.app import _Server, build, connection_info
+from dev_link_mcp.app import _banner, _Server, build, connection_info
 from dev_link_mcp.audit import AuditStore
 from dev_link_mcp.config import Config
 from dev_link_mcp.middleware import AuditMiddleware, result_text
@@ -153,6 +153,30 @@ async def test_server_main_loop_ticks_once_a_second_and_wakes_on_signal():
     server.handle_exit(signal.SIGTERM, None)
     await asyncio.wait_for(task, 0.5)
     assert time.monotonic() - started < 0.5
+
+
+@pytest.mark.parametrize("auth", ["path-token", "bearer"])
+def test_banner_shows_the_token_only_on_a_terminal(tmp_path, workspace, auth):
+    cfg = Config(workspace=workspace, state_dir=tmp_path / "state", server={"auth": auth}).finalize()
+    token = cfg.server.token
+    conn_file = cfg.state_dir / "connection.json"
+    shown = _banner(cfg, "bubblewrap", 12, conn_file, show_token=True)
+    # The dashboard URL and the `claude mcp add` line, plus the MCP URL in path-token mode.
+    assert shown.count(token) == (3 if auth == "path-token" else 2)
+    assert "***" not in shown and "connection.json" not in shown
+    hidden = _banner(cfg, "bubblewrap", 12, conn_file, show_token=False)
+    assert token not in hidden
+    assert hidden.count("***") == shown.count(token)
+    assert f"  token     : hidden because this output is not a terminal; see {conn_file}\n" in hidden
+
+
+def test_banner_without_auth_has_nothing_to_hide(tmp_path, workspace):
+    cfg = Config(workspace=workspace, state_dir=tmp_path / "state", server={"auth": "none", "token": "e"}).finalize()
+    conn_file = cfg.state_dir / "connection.json"
+    shown = _banner(cfg, "bubblewrap", 12, conn_file, show_token=True)
+    assert _banner(cfg, "bubblewrap", 12, conn_file, show_token=False) == shown
+    assert "token" not in shown and "***" not in shown
+    assert "  workspace : " in shown and "  sandbox   : bubblewrap\n" in shown
 
 
 @pytest.fixture(autouse=True)

@@ -57,7 +57,8 @@ Everything lives under `src/dev_link_mcp/`.
 | `live.py` | Fan-out of live messages to open dashboard tabs. |
 | `sandbox/` | The `Sandbox` facade, the backends and resource limits. |
 | `tools/` | Built-in tool groups, one module or package each, and `tools/__init__.py`, which loads built-ins and plugins and registers them. `tools/project/` is split into detection, test-output parsers and tool registration. |
-| `processes.py` | `ProcessManager`: background processes, their log files and cleanup. |
+| `processes.py` | `ProcessManager`: background processes, their log files and cleanup. Output reaches the log through a pipe the server reads, so the token is redacted before it is written. |
+| `orphans.py` | The guard process that kills unconfined children and cloudflared if the server dies without cleaning up. |
 | `runtime.py` | `Runtime`, the handles every group receives. |
 | `workspace.py` | Path confinement, symlink-refusing file access through directory descriptors, and the `.dev-link` directory. |
 | `patterns.py` | Agent regexes (`wait_for_process`, `replace_in_files`) in a worker process that is killed at its deadline. |
@@ -83,7 +84,7 @@ Each workspace has a state dir, by default `$XDG_STATE_HOME/dev-link-mcp/<folder
 | --- | --- |
 | `server.lock` | flock held by the running server, with its PID. |
 | `connection.json` | MCP and dashboard URLs, workspace and PID (0600); removed on stop. |
-| `server.log`, `tunnel.log` | Output of a background server and of cloudflared (0600). The banner in `server.log` contains the URLs with the token. |
+| `server.log`, `tunnel.log` | Output of a background server and of cloudflared (0600). The token is replaced with `***` in both; the banner shows it only on a terminal. |
 | `audit.sqlite3`, `audit.jsonl` | Every event; the dashboard reads SQLite, the JSONL is for grep and log shippers. `args` is a JSON object, or a string when it was clipped to `audit.result_bytes`. |
 | `processes/` | One log file per background process. |
 | `home/` | Private home directory mounted over your real home inside the sandbox. Persists between runs. |
@@ -104,11 +105,15 @@ Without an explicit port it takes the first free one from 8765.
 `Runtime.create` runs:
 
 1. The sandbox is set up first, so a backend or limit that cannot work stops the start before
-   anything else is opened. bubblewrap is probed with one throwaway sandbox.
+   anything else is opened. A state dir the sandbox would mount is refused, then bubblewrap is
+   probed with one throwaway sandbox.
 2. The audit store opens, marks events left running by a crash as errors, and deletes events,
    JSONL lines and process logs older than `audit.retention_days` (default 30).
 3. Tool groups are registered and the dashboard routes added. Then `connection.json` is
-   written and uvicorn starts.
+   written and uvicorn starts. While it runs, the prune repeats once a day in a worker
+   thread, keeping the logs of processes the server still lists. Those passes delete in small
+   batches, copy the JSONL without holding the store lock and skip VACUUM, so audit writes on
+   the event loop barely wait; the SQLite file only shrinks at startup.
 
 The browser group starts Chromium on first use and closes it after `idle_timeout_s` (default
 300 s) without a browser call.
@@ -116,6 +121,17 @@ The browser group starts Chromium on first use and closes it after `idle_timeout
 `dev-link stop` sends SIGTERM to the server's process group, and SIGKILL after 10 s. On the way
 down the server stops the tunnel first, removes `connection.json`, kills every background
 process, awaits each group's `shutdown()`, records a stop event and closes the audit store.
+
+If the server dies without that shutdown (SIGKILL, a crash), bubblewrap commands die with it
+(`--die-with-parent`). cloudflared and commands under `--no-sandbox` have no such link, so
+`orphans.py` covers them: the first one started also starts a small guard process in its own
+session. The guard reads from a pipe which process groups (and limits scopes) the server has
+started and which it has since cleaned up. When the server is gone the pipe closes, and the
+guard SIGKILLs whatever is still listed.
+
+With `--tunnel` the server checks cloudflared once a second. If it has exited, the public URL is
+dead, so the server shuts down the normal way, records the reason on its stop event and exits
+with status 1. The reason and the end of `tunnel.log` go to stderr (`server.log` for `start`).
 
 ## Dashboard
 

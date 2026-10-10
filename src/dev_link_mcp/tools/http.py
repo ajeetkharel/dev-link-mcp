@@ -1,15 +1,13 @@
 """HTTP client tools: raw requests, readable page fetches, and downloads into the workspace.
 
 Requests are made by the server process with httpx, not inside the sandbox. When the
-sandbox network is off, every request (including each redirect hop) must target loopback.
+sandbox network is off, every request is refused: the server's loopback is the host's, not the sandbox's.
 """
 
 import asyncio
 import hashlib
-import ipaddress
 import json as jsonlib
 import re
-import socket
 import tempfile
 import time
 from dataclasses import dataclass
@@ -25,7 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from dev_link_mcp.runtime import Runtime
 from dev_link_mcp.tools.base import ToolGroup
-from dev_link_mcp.tools.common import NETWORK_OFF_REFUSED_HINT, OPEN_WORLD, OPEN_WORLD_READ, clip
+from dev_link_mcp.tools.common import OPEN_WORLD, OPEN_WORLD_READ, clip
 
 Method = Literal["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
 
@@ -34,31 +32,21 @@ _SECRET_HEADERS = frozenset({"authorization", "proxy-authorization", "cookie", "
 _TEXT_TYPE_MARKERS = ("json", "xml", "javascript", "x-www-form-urlencoded", "yaml", "csv", "graphql")
 
 
-def _failure(action: str, rt: Runtime, exc: httpx.HTTPError) -> str:
-    message = f"{action}: {type(exc).__name__}: {exc or 'no details'}"
-    # With the network off only loopback URLs get this far, so a refused connection is a local server.
-    if isinstance(exc, httpx.ConnectError) and not rt.config.sandbox.network:
-        message += f"\n{NETWORK_OFF_REFUSED_HINT}"
-    return message
+def _failure(action: str, exc: httpx.HTTPError) -> str:
+    return f"{action}: {type(exc).__name__}: {exc or 'no details'}"
 
 
 def _check_url(rt: Runtime, url: httpx.URL) -> None:
-    """Reject non-HTTP schemes and, when the sandbox network is off, non-loopback hosts."""
+    """Reject every URL when the sandbox network is off, and non-HTTP schemes or hostless URLs otherwise."""
+    if not rt.config.sandbox.network:
+        raise ToolError(
+            "network access is off on this server, so HTTP requests are refused; ask the user to restart"
+            " the server with network access"
+        )
     if url.scheme not in ("http", "https"):
         raise ToolError(f"only http and https URLs are supported, got {url.scheme or 'no'} scheme: {url}")
     if not url.host:
         raise ToolError(f"URL has no host: {url}")
-    if rt.config.sandbox.network:
-        return
-    host = url.host.lower().rstrip(".")
-    if host == "localhost" or host.endswith(".localhost"):
-        return
-    try:
-        if ipaddress.ip_address(host).is_loopback:
-            return
-    except ValueError:
-        pass
-    raise ToolError(f"network access is disabled on this server; only loopback URLs are allowed, not {url.host}")
 
 
 def _parse_url(rt: Runtime, url: str) -> httpx.URL:
@@ -79,65 +67,15 @@ def _timeout(rt: Runtime, timeout_s: float | None, default_s: float) -> float:
     return value
 
 
-class _LoopbackTransport(httpx.AsyncHTTPTransport):
-    """Transport for network-off requests that pins `localhost` names to the loopback address they resolve to.
-
-    `_check_url` lets `localhost` and `*.localhost` through by name, but without nss-myhostname or an
-    /etc/hosts entry such a name is looked up in DNS and may point anywhere. So the name is resolved
-    here, every answer must be loopback, and the connection goes to that exact address with the
-    original Host header and TLS server name. Raises ToolError for names that do not resolve or
-    resolve to anything but loopback; IP literals pass through unchanged.
-    """
-
-    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        host = request.url.host
-        try:
-            ipaddress.ip_address(host)
-        except ValueError:
-            pass
-        else:
-            return await super().handle_async_request(request)
-        try:
-            infos = await asyncio.get_running_loop().getaddrinfo(host, request.url.port, type=socket.SOCK_STREAM)
-        except OSError as exc:
-            raise ToolError(f"could not resolve {host}: {exc}") from exc
-        addresses = list(dict.fromkeys(str(info[4][0]) for info in infos))
-        if not addresses or not all(ipaddress.ip_address(a.split("%", 1)[0]).is_loopback for a in addresses):
-            raise ToolError(
-                f"network access is disabled on this server; {host} resolves to {', '.join(addresses) or 'nothing'},"
-                " not only loopback"
-            )
-        # Try each address in order like a normal connect would, since `localhost` is often ::1 first
-        # while the server listens on 127.0.0.1 only (or the other way round).
-        error: httpx.ConnectError | None = None
-        for address in addresses:
-            pinned = httpx.Request(
-                request.method,
-                request.url.copy_with(host=address),
-                headers=request.headers,
-                stream=request.stream,
-                extensions={**request.extensions, "sni_hostname": host},
-            )
-            try:
-                return await super().handle_async_request(pinned)
-            except httpx.ConnectError as exc:
-                error = exc
-        assert error is not None
-        raise error
-
-
 def _client(rt: Runtime, timeout_s: float, follow_redirects: bool, max_redirects: int) -> httpx.AsyncClient:
     async def guard(request: httpx.Request) -> None:
-        # Runs for every hop, so a public server cannot redirect us past the loopback rule.
+        # Runs for every redirect hop too, so a redirect cannot lead somewhere the first check would refuse.
         _check_url(rt, request.url)
 
     return httpx.AsyncClient(
         timeout=timeout_s,
         follow_redirects=follow_redirects,
         max_redirects=max_redirects,
-        # Env proxies would route loopback-only traffic off the machine when the network is off.
-        trust_env=rt.config.sandbox.network,
-        transport=None if rt.config.sandbox.network else _LoopbackTransport(),
         event_hooks={"request": [guard]},
     )
 
@@ -191,7 +129,7 @@ async def _fetch(
     except httpx.TooManyRedirects as exc:
         raise ToolError(f"more than {max_redirects} redirects: {url}") from exc
     except httpx.HTTPError as exc:
-        raise ToolError(_failure("request failed", rt, exc)) from exc
+        raise ToolError(_failure("request failed", exc)) from exc
     except UnicodeEncodeError as exc:
         raise ToolError(f"header names and values must be ASCII: {exc}") from exc
     return _Fetched(response, bytes(buf), truncated, time.monotonic() - start)
@@ -539,7 +477,7 @@ def _register(mcp: MCPServer, rt: Runtime, settings: HttpSettings) -> None:
             except httpx.TooManyRedirects as exc:
                 raise ToolError(f"more than {max_redirects} redirects: {parsed}") from exc
             except httpx.HTTPError as exc:
-                raise ToolError(_failure("download failed", rt, exc)) from exc
+                raise ToolError(_failure("download failed", exc)) from exc
             fh.seek(0)
             try:
                 await asyncio.to_thread(rt.workspace.write_file, target, fh)

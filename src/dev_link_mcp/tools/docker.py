@@ -3,10 +3,12 @@
 The docker socket is root-equivalent, so commands run on the host (not in bubblewrap)
 and the group is opt-in. To keep the agent inside the workspace the tools never mount
 anything but the workspace, never pass --privileged or host namespaces, reject compose
-files that ask for those, and only touch containers this workspace created.
+files that ask for those, and only touch containers this workspace created. With
+`sandbox.network` off, containers get no outside network, nothing is pulled and nothing is built.
 """
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -298,7 +300,14 @@ def compose_violations(config: dict[str, Any], root: Path) -> list[str]:
             problems.append(f"volume {name!r}: external volumes are not allowed (they belong to other projects)")
         if vol.get("driver") not in (None, "local"):
             problems.append(f"volume {name!r}: driver {vol['driver']!r} is not allowed")
-        device = (vol.get("driver_opts") or {}).get("device")
+        opts = vol.get("driver_opts") or {}
+        # Any other type makes the daemon mount, as root on the host, a network share (nfs, cifs)
+        # or host paths named in `o` (overlay lowerdir), which the device check cannot see.
+        if opts.get("type") not in (None, "none", "bind", "tmpfs"):
+            problems.append(
+                f"volume {name!r}: driver_opts type {opts['type']!r} is not allowed (only none, bind, tmpfs)"
+            )
+        device = opts.get("device")
         if device and outside(str(device)):
             problems.append(f"volume {name!r}: driver_opts device {device!r} is outside the workspace")
     for name, net in (config.get("networks") or {}).items():
@@ -339,6 +348,67 @@ def _build_violations(where: str, build: dict[str, Any], outside: Callable[[str]
             if key in ("src", "dest") and outside(value):
                 problems.append(f"{where}: build cache path {value!r} is outside the workspace")
     return problems
+
+
+# With the network off nothing the agent controls may reach the network. The daemon does that on
+# its behalf for image pulls, log drivers and builds (ADD <url>, base images, remote contexts),
+# so builds are refused rather than checked.
+_LOCAL_ONLY = "it must already exist locally, or the server must be restarted with network access"
+_NO_BUILDS = (
+    "the server's network is off, so images cannot be built; build them with the network on or use local images"
+)
+_LOCAL_LOG_DRIVERS = frozenset({"json-file", "local", "journald", "none"})
+# An internal network still gives the host an address on its bridge, so containers reach every host
+# service listening on 0.0.0.0. Isolated gateway modes (Docker 28+) leave the bridge without one.
+_ISOLATED_GATEWAY = {
+    "com.docker.network.bridge.gateway_mode_ipv4": "isolated",
+    "com.docker.network.bridge.gateway_mode_ipv6": "isolated",
+}
+_MIN_ISOLATING_DOCKER = 28
+
+
+def offline_compose(config: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """A copy of a resolved compose config, already accepted by `compose_violations`, rewritten so
+    its containers reach nothing outside the project: every network internal without a host address
+    on it, and no image pulls.
+    Also returns the settings that cannot work that way (builds, published ports, network modes,
+    external networks, ...).
+    """
+    config = copy.deepcopy(config)
+    problems: list[str] = []
+    services = config.get("services") or {}
+    for name, svc in services.items():
+        where = f"service {name!r}"
+        mode = svc.get("network_mode")
+        kind, _, target = str(mode).partition(":")
+        if mode is not None and mode != "none" and not (kind == "service" and target in services):
+            problems.append(f"{where}: network_mode: {mode} is not allowed (use none, service:<name> or networks)")
+        if svc.get("ports"):
+            problems.append(
+                f"{where}: ports cannot be published on internal networks; services reach each other by name"
+            )
+        policy = svc.get("pull_policy")
+        if policy in (None, "missing", "if_not_present"):
+            svc["pull_policy"] = "never"
+        elif policy != "never":
+            problems.append(f"{where}: pull_policy {policy} pulls or builds images")
+        driver = (svc.get("logging") or {}).get("driver")
+        if driver is not None and driver not in _LOCAL_LOG_DRIVERS:
+            problems.append(f"{where}: logging driver {driver} may send logs over the network")
+        if svc.get("build"):
+            problems.append(f"{where} has build: {_NO_BUILDS}")
+    networks = config.get("networks") or {}
+    for name, net in networks.items():
+        net = networks[name] = net or {}
+        if net.get("external"):
+            problems.append(f"network {name!r}: external networks are not allowed")
+        if net.get("driver") not in (None, "bridge"):
+            problems.append(f"network {name!r}: driver {net['driver']} is not allowed (only bridge)")
+        if net.get("driver_opts"):
+            problems.append(f"network {name!r}: driver_opts are not allowed")
+        net["internal"] = True
+        net["driver_opts"] = dict(_ISOLATED_GATEWAY)
+    return config, problems
 
 
 class DockerSettings(BaseModel):
@@ -446,6 +516,111 @@ def _register(mcp: MCPServer, rt: Runtime, settings: DockerSettings, started: _S
                     " set a different top-level `name:` in the compose file"
                 )
 
+    def offline() -> bool:
+        return not rt.config.sandbox.network
+
+    async def local_image(ref: str) -> bool:
+        """Whether image `ref` exists in the local image store."""
+        result = await docker(["image", "inspect", "--format", "{{.Id}}", "--", ref])
+        return result.ok
+
+    async def isolated_networks(names: Sequence[str]) -> dict[str, bool]:
+        """Whether each existing network in `names` is internal with isolated gateways, so it reaches
+        neither the outside nor the host; missing networks are left out.
+
+        Raises ToolError when docker times out or fails for another reason than a missing network,
+        because an empty answer would pass every caller's check.
+        """
+        if not names:
+            return {}
+        result = await docker(
+            ["network", "inspect", "--format", "{{json .Name}} {{json .Internal}} {{json .Options}}", *names]
+        )
+        # Exits non-zero when some name is missing but still prints the others (and a blank line).
+        errors = [line for line in result.stderr.splitlines() if line.strip()]
+        if result.timed_out or (not result.ok and not all(line.endswith(" not found") for line in errors)):
+            raise fail("docker network inspect", result)
+        flags = {}
+        for line in filter(None, result.stdout.splitlines()):
+            name, internal, options = line.split(" ", 2)
+            opts = json.loads(options) or {}
+            isolated = all(opts.get(key) == value for key, value in _ISOLATED_GATEWAY.items())
+            flags[json.loads(name)] = json.loads(internal) is True and isolated
+        return flags
+
+    async def outside_networks(cid: str, *, follow: bool = True) -> list[str]:
+        """Networks that give container `cid` access beyond isolated internal networks (see
+        isolated_networks); empty when it has none.
+
+        A container sharing another's network namespace is judged by that container, one hop only.
+        """
+        result = await docker(
+            [
+                "container",
+                "inspect",
+                "--format",
+                "{{json .HostConfig.NetworkMode}} {{json .NetworkSettings.Networks}}",
+                cid,
+            ]
+        )
+        if not result.ok:
+            raise fail(f"docker inspect {cid}", result)
+        mode_raw, networks_raw = result.stdout.strip().split(" ", 1)
+        mode = json.loads(mode_raw)
+        if mode == "none":
+            return []
+        if mode.startswith("container:"):
+            return await outside_networks(mode.partition(":")[2], follow=False) if follow else [mode]
+        names = sorted(json.loads(networks_raw) or {})
+        isolated = await isolated_networks(names)
+        return [name for name in names if not isolated.get(name, False)]
+
+    async def offline_compose_problems(config: dict[str, Any], action: str, project: str) -> list[str]:
+        """Check the offline config for `action` against the daemon: it must isolate networks from the
+        host, images and image volumes of up must be local, and containers or networks of the project
+        left from a run with the network on (or from an older server) are refused, because up and
+        restart reuse them."""
+        version = await docker(["version", "--format", "{{.Server.Version}}"])
+        found = version.stdout.strip() if version.ok else ""
+        major = re.match(r"\d+", found)
+        if major is None or int(major[0]) < _MIN_ISOLATING_DOCKER:
+            return [
+                f"Docker {found or '(unknown version)'} cannot isolate internal networks from the host;"
+                f" it needs Docker {_MIN_ISOLATING_DOCKER} or newer"
+            ]
+        problems: list[str] = []
+        if action == "up":
+            for name, svc in (config.get("services") or {}).items():
+                image = str(svc.get("image") or "")
+                if not _IMAGE.match(image) or not await local_image(image):
+                    problems.append(f"service {name!r}: image {image} is not available locally; {_LOCAL_ONLY}")
+                # The daemon pulls a missing image volume source even with pull_policy never.
+                for vol in svc.get("volumes") or []:
+                    source = str(vol.get("source") or "")
+                    if vol.get("type") == "image" and (not _IMAGE.match(source) or not await local_image(source)):
+                        problems.append(
+                            f"service {name!r}: image volume {source} is not available locally; {_LOCAL_ONLY}"
+                        )
+        if action not in ("up", "restart"):
+            return problems
+        leftovers = []
+        listed = await docker(
+            ["ps", "--all", "--quiet", "--no-trunc", "--filter", f"label=com.docker.compose.project={project}"]
+        )
+        if not listed.ok:
+            raise fail("docker ps", listed)
+        for cid in listed.stdout.split():
+            if await outside_networks(cid):
+                leftovers.append(f"container {cid[:12]}")
+        names = [str(net.get("name") or key) for key, net in (config.get("networks") or {}).items()]
+        leftovers += [f"network {name}" for name, ok in (await isolated_networks(names)).items() if not ok]
+        if leftovers:
+            problems.append(
+                f"{', '.join(leftovers)} of project {project!r} can reach the network or the host (left from a run"
+                " with the network on or from an older server); run compose down first"
+            )
+        return problems
+
     def compose_file(file: str | None) -> Path:
         if file:
             path = rt.workspace.resolve(file, must_exist=True)
@@ -518,8 +693,11 @@ def _register(mcp: MCPServer, rt: Runtime, settings: DockerSettings, started: _S
             ),
         ] = None,
     ) -> str:
-        """Build an image from a Dockerfile in the workspace; base images may be pulled. Returns the
-        build log (clipped); a failed build is a tool error carrying the log."""
+        """Build an image from a Dockerfile in the workspace; base images may be pulled. Refused when
+        the server's network is off. Returns the build log (clipped); a failed build is a tool error
+        carrying the log."""
+        if offline():
+            raise ToolError(_NO_BUILDS)
         _check_image(tag, "tag")
         ctx = rt.workspace.resolve(context, must_exist=True)
         if not ctx.is_dir():
@@ -572,9 +750,17 @@ def _register(mcp: MCPServer, rt: Runtime, settings: DockerSettings, started: _S
         The workspace is the only host mount allowed; privileged mode and host namespaces are not
         available. detach=True returns the container id and published ports; detach=False waits and
         returns the exit code and output, like run_command, and removes the container. Detached
-        containers are stopped (not removed) when the server stops."""
+        containers are stopped (not removed) when the server stops. With the server's network off
+        the container has no network (--network none), ports cannot be published and the image
+        must already be local."""
         _check_image(image)
         args = ["run", "--label", workspace_label]
+        if offline():
+            if ports:
+                raise ToolError("ports cannot be published: the server's network is off, so the container has none")
+            if not await local_image(image):
+                raise ToolError(f"image {image} is not available locally and the network is off; {_LOCAL_ONLY}")
+            args += ["--network", "none", "--pull", "never"]
         if name:
             args += ["--name", _check_name(name, "container name")]
         elif not detach:
@@ -653,12 +839,18 @@ def _register(mcp: MCPServer, rt: Runtime, settings: DockerSettings, started: _S
     ) -> str:
         """Run a shell command inside a running container started from this workspace. The image must
         have `sh`. Returns exit code, stdout and stderr; a non-zero exit is reported in the text. On timeout
-        only the docker client is killed; the command may keep running in the container."""
+        only the docker client is killed; the command may keep running in the container. With the
+        server's network off, containers that have network access (started while it was on) are refused."""
         if not command.strip():
             raise ToolError("command is empty")
         cid, running = await own_container(container)
         if not running:
             raise ToolError(f"container {container} is not running")
+        if offline() and (networks := await outside_networks(cid)):
+            raise ToolError(
+                f"container {container} has network access ({', '.join(networks)}) and the server's network is off;"
+                " remove it and start it again"
+            )
         result = await docker(["exec", cid, "sh", "-c", command], timeout_s=timeout(timeout_s))
         return clip(result.format(), limits.max_output_bytes)
 
@@ -717,10 +909,13 @@ def _register(mcp: MCPServer, rt: Runtime, settings: DockerSettings, started: _S
     ) -> str:
         """Run docker compose for a compose file in the workspace. The resolved config is refused, with
         each problem listed, if it reaches outside the workspace (privileged, host namespaces, cap_add,
-        devices, external volumes, paths outside the workspace, unknown keys, ...) or its project name
-        belongs to containers from elsewhere. down keeps named volumes. Containers started with up or
-        restart are stopped (not removed) when the server stops. A failing command is a tool error
-        carrying compose's output."""
+        devices, external volumes, network-share volumes, paths outside the workspace, unknown keys,
+        ...) or its project name belongs to containers from elsewhere. down keeps named volumes.
+        Containers started with up or restart are stopped (not removed) when the server stops. With the
+        server's network off, up, restart and build put every service on internal networks (services
+        reach each other, not the host or anything else; needs Docker 28 or newer) and never pull;
+        builds, ports, external networks and images or image volumes missing locally are refused. A
+        failing command is a tool error carrying compose's output."""
         path = compose_file(file)
         for svc in services or []:
             _check_name(svc, "service")
@@ -749,6 +944,15 @@ def _register(mcp: MCPServer, rt: Runtime, settings: DockerSettings, started: _S
             raise ToolError("compose file refused:\n- " + "\n- ".join(problems))
         project = str(config.get("name") or "")
         await own_project(project)
+        run_config = checked.stdout
+        # down, ps and logs start nothing, so they keep working on a project from a run with the network on.
+        if offline() and action in ("up", "restart", "build"):
+            config, problems = offline_compose(config)
+            if not problems:
+                problems = await offline_compose_problems(config, action, project)
+            if problems:
+                raise ToolError("compose file refused, the server's network is off:\n- " + "\n- ".join(problems))
+            run_config = json.dumps(config)
         base += ["--project-name", project]
         sub: list[str] = {
             "up": ["up", *(["--detach"] if detach else [])],
@@ -768,7 +972,7 @@ def _register(mcp: MCPServer, rt: Runtime, settings: DockerSettings, started: _S
             # The resolved config that passed the check, not the file: .env, include and extends
             # are read again by path and could be swapped in between. Compose keeps literal $ escaped
             # as $$ in this output, so nothing is substituted twice.
-            stdin=checked.stdout.encode(),
+            stdin=run_config.encode(),
         )
         if not result.ok:
             raise fail(f"compose {action}", result)

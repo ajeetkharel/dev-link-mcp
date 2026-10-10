@@ -310,7 +310,7 @@ def add_dashboard_routes(mcp: MCPServer, rt: Runtime, toolset: Toolset) -> None:
                 text, offset = await asyncio.to_thread(rt.processes.read_log, pid, offset=offset, max_bytes=limit)
         except ToolError as exc:  # unknown process id
             return _error(404, str(exc))
-        return JSONResponse({"text": rt.audit.redact(text), "offset": offset})
+        return JSONResponse({"text": text, "offset": offset})
 
     @route(f"{api}/processes/{{pid}}/stop", method="POST")
     async def process_stop(request: Request) -> Response:

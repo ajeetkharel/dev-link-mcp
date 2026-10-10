@@ -12,10 +12,12 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import tempfile
 import threading
 import time
+from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -81,6 +83,10 @@ _SUMMARY_COLUMNS = (
 SLICE_FIELDS = ("args", "result", "error")
 SLICE_DEFAULT = 65536
 SLICE_MAX = 1048576
+# Old events deleted per hold of the store lock. A row can carry a large result, and SQLite frees
+# its pages as it deletes (and zeroes them where SQLite has secure_delete on), so one DELETE of every
+# old row can hold up writes for seconds.
+_PRUNE_BATCH = 25
 
 
 @dataclass(frozen=True)
@@ -90,6 +96,82 @@ class Pruned:
     events: int
     jsonl_lines: int
     process_logs: int
+
+
+def redact(text: str, secrets: list[str]) -> str:
+    """`text` with every occurrence of each non-empty secret replaced by ***."""
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "***")
+    return text
+
+
+class StreamRedactor:
+    """Redacts secrets from output that arrives in chunks, such as a pipe read piece by piece.
+
+    Works on bytes, so output that is not UTF-8 passes through unchanged. A secret split over
+    two chunks is still caught: the end of a chunk is held back while it could be the start of
+    a secret, and only then. Output that ends in such a start is not a secret, so flush()
+    returns it as it is.
+    """
+
+    def __init__(self, secrets: list[str]):
+        self._secrets = [s.encode() for s in secrets if s]
+        self._held = b""
+
+    def feed(self, chunk: bytes) -> bytes:
+        """The redacted output that is safe to write now; may be shorter than `chunk`, or empty."""
+        data = self._held + chunk
+        for secret in self._secrets:
+            data = data.replace(secret, b"***")
+        keep = self._partial(data)
+        self._held = data[len(data) - keep :]
+        return data[: len(data) - keep]
+
+    @property
+    def holding(self) -> bool:
+        """True while feed() is holding back output that could be the start of a secret."""
+        return bool(self._held)
+
+    def flush(self) -> bytes:
+        """What feed() held back, for when the output has ended or paused."""
+        rest, self._held = self._held, b""
+        return rest
+
+    def _partial(self, data: bytes) -> int:
+        """Length of the longest end of `data` that is the start of a secret, at most one byte short of it."""
+        for size in range(min(max((len(s) for s in self._secrets), default=1) - 1, len(data)), 0, -1):
+            end = data[-size:]
+            if any(s.startswith(end) for s in self._secrets):
+                return size
+        return 0
+
+
+class SecretLogFilter(logging.Filter):
+    """Logging filter that replaces secrets with *** in the message, its arguments and any
+    traceback before a handler writes the record. Add it to handlers, not loggers: a logger's
+    filters miss records that propagate from its children."""
+
+    def __init__(self, secrets: list[str]):
+        super().__init__()
+        self._secrets = [s for s in secrets if s]
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            # Arguments that do not fit the format. Left as they are, the handler's error report
+            # would print them unredacted, so keep both as plain text instead.
+            message = f"{record.msg} {record.args!r}"
+        record.msg, record.args = redact(message, self._secrets), None
+        if record.exc_info and not record.exc_text:
+            # Formatters reuse exc_text instead of formatting the exception again.
+            record.exc_text = logging.Formatter().formatException(record.exc_info)
+        if record.exc_text:
+            record.exc_text = redact(record.exc_text, self._secrets)
+        if record.stack_info:
+            record.stack_info = redact(record.stack_info, self._secrets)
+        return True
 
 
 class AuditStore:
@@ -106,6 +188,8 @@ class AuditStore:
         self._secrets = [s for s in secrets if s]
         self._result_bytes = result_bytes
         self._lock = threading.Lock()
+        # One prune at a time: the JSONL rewrite copies outside the store lock.
+        self._pruning = threading.Lock()
         self._db = sqlite3.connect(self.db_path, check_same_thread=False, isolation_level=None)
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
@@ -116,9 +200,11 @@ class AuditStore:
         self.live = LiveFeed()
 
     def redact(self, text: str) -> str:
-        for secret in self._secrets:
-            text = text.replace(secret, "***")
-        return text
+        return redact(text, self._secrets)
+
+    def stream_redactor(self) -> StreamRedactor:
+        """A new StreamRedactor for this store's secrets, for one stream of output."""
+        return StreamRedactor(self._secrets)
 
     def _redact_value(self, value: Any) -> Any:
         if isinstance(value, dict):
@@ -174,10 +260,12 @@ class AuditStore:
                 "UPDATE events SET ended=?, status=?, duration_ms=?, result=?, result_bytes=?, error=? WHERE id=?",
                 (now, "ok" if ok else "error", duration, result_text, size, error_text, event_id),
             )
-        event = self.get(event_id)
-        if event:
-            self._jsonl.write(json.dumps(event, default=str) + "\n")
-            self._jsonl.flush()
+            # Appended under the lock: a prune in another thread swaps the file and this handle.
+            sql = f"SELECT {','.join(_COLUMNS)} FROM events WHERE id=?"  # noqa: S608
+            row = self._db.execute(sql, (event_id,)).fetchone()
+            if row:
+                self._jsonl.write(json.dumps(self._row(row), default=str) + "\n")
+                self._jsonl.flush()
         self._publish(event_id)
 
     def record(
@@ -350,65 +438,94 @@ class AuditStore:
                 " WHERE status='running'"
             )
 
-    def prune(self, days: int, process_logs: Path) -> Pruned:
+    def prune(self, days: int, process_logs: Path, keep: Collection[Path] = (), *, vacuum: bool = False) -> Pruned:
         """Delete everything older than `days` days: SQLite events, process logs and JSONL lines, in that order.
 
         `process_logs` is the directory of background process logs; it may not exist. Process
-        logs go by mtime, so the log of a process that is still writing is kept. They go before
-        the JSONL because rewriting it needs free space for a copy. Rewrites audit.jsonl, so
-        only one store may have the state dir open; call this at startup, before anything is
-        recorded. Raises sqlite3.Error if the DELETE fails (nothing else is pruned then) and
-        OSError if the JSONL cannot be rewritten; the store stays usable either way.
+        logs go by mtime; the paths in `keep` stay whatever their age, for processes whose
+        output can still be read. Logs go before the JSONL because rewriting it needs free space
+        for a copy. `vacuum` shrinks the SQLite file afterwards; it rewrites the whole database
+        under the store lock, so only ask for it when nothing else is recording. Without it the
+        freed pages are reused by later events.
+
+        Rewrites audit.jsonl, so only one store may have the state dir open. Safe to call from
+        another thread while events are recorded: events are deleted in small batches and the
+        JSONL is copied without the store lock, so writes wait only briefly. Raises sqlite3.Error
+        if a DELETE fails (nothing else is pruned then) and OSError if the JSONL cannot be
+        rewritten; the store stays usable either way.
         """
         cutoff = time.time() - days * 86400
-        with self._lock:
-            events = self._db.execute("DELETE FROM events WHERE ts < ?", (cutoff,)).rowcount
-            if events:
-                try:
-                    self._db.execute("VACUUM")
-                except sqlite3.OperationalError as exc:
-                    # The rows are gone either way; the file just keeps its free pages until a later VACUUM.
-                    log.warning("audit store VACUUM failed, the file keeps its size: %s", exc)
-                else:
-                    # VACUUM writes the whole database through the WAL, which otherwise stays that
-                    # size on disk until the server stops.
-                    self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            logs = _prune_logs(process_logs, cutoff)
+        with self._pruning:
+            events = 0
+            while True:
+                with self._lock:
+                    deleted = self._db.execute(
+                        "DELETE FROM events WHERE id IN (SELECT id FROM events WHERE ts < ? ORDER BY id LIMIT ?)",
+                        (cutoff, _PRUNE_BATCH),
+                    ).rowcount
+                events += deleted
+                if deleted < _PRUNE_BATCH:
+                    break
+            if events and vacuum:
+                with self._lock:
+                    try:
+                        self._db.execute("VACUUM")
+                    except sqlite3.OperationalError as exc:
+                        # The rows are gone either way; the file just keeps its free pages until a later VACUUM.
+                        log.warning("audit store VACUUM failed, the file keeps its size: %s", exc)
+                    else:
+                        # VACUUM writes the whole database through the WAL, which otherwise stays that
+                        # size on disk until the server stops.
+                        self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            logs = _prune_logs(process_logs, cutoff, keep)
             lines = self._prune_jsonl(cutoff)
         return Pruned(events=events, jsonl_lines=lines, process_logs=logs)
 
     def _prune_jsonl(self, cutoff: float) -> int:
-        """Rewrite audit.jsonl without lines whose `ts` is before `cutoff`. Caller holds the lock.
+        """Rewrite audit.jsonl without lines whose `ts` is before `cutoff`. Caller holds `_pruning`, not `_lock`.
 
-        Leaves the file and the append handle alone when no line is old enough.
+        Copies the kept lines to a temp file without the store lock, then takes it only to add
+        the lines appended meanwhile and swap the files. Leaves the file and the append handle
+        alone when no line is old enough.
         """
         # A read-only pass first, so the usual startup with nothing to drop writes nothing.
         # Bytes, so a line that is not valid UTF-8 is kept as it is instead of failing the prune.
         with self.jsonl_path.open("rb") as src:
             if not any(_older(line, cutoff) for line in src):
                 return 0
+        with self._lock:
+            # Appends are flushed under the lock, so the file ends with a whole line here.
+            copied = self.jsonl_path.stat().st_size
         fd, tmp_name = tempfile.mkstemp(dir=self.jsonl_path.parent, prefix=".audit.jsonl.", suffix=".tmp")
         tmp = Path(tmp_name)
         dropped = 0
         try:
             # The temp fd is wrapped first so it is closed even when opening the source fails.
-            with os.fdopen(fd, "wb") as dst:
-                self._jsonl.close()
-                with self.jsonl_path.open("rb") as src:
-                    for line in src:
-                        if _older(line, cutoff):
-                            dropped += 1
-                        else:
-                            dst.write(line)
-                if dropped:
-                    # On disk before the rename, so a crash cannot swap in an empty file.
-                    dst.flush()
-                    os.fsync(dst.fileno())
-            if dropped:
-                os.replace(tmp, self.jsonl_path)
+            with os.fdopen(fd, "wb") as dst, self.jsonl_path.open("rb") as src:
+                while src.tell() < copied:
+                    line = src.readline(copied - src.tell())
+                    if not line:
+                        break  # Shorter than it was: someone else truncated it; keep what is left.
+                    if _older(line, cutoff):
+                        dropped += 1
+                    else:
+                        dst.write(line)
+                # Most of the data reaches the disk here, so the fsync under the lock is short.
+                dst.flush()
+                os.fsync(dst.fileno())
+                with self._lock:
+                    self._jsonl.close()
+                    try:
+                        # Lines finished since the copy started; they are new, so all are kept.
+                        shutil.copyfileobj(src, dst)
+                        # On disk before the rename, so a crash cannot swap in a short file.
+                        dst.flush()
+                        os.fsync(dst.fileno())
+                        os.replace(tmp, self.jsonl_path)
+                    finally:
+                        self._jsonl = self.jsonl_path.open("a", encoding="utf-8")
         finally:
             tmp.unlink(missing_ok=True)
-            self._jsonl = self.jsonl_path.open("a", encoding="utf-8")
         return dropped
 
     def _publish(self, event_id: int) -> None:
@@ -447,10 +564,12 @@ def _older(line: bytes, cutoff: float) -> bool:
     return isinstance(ts, int | float) and not isinstance(ts, bool) and ts < cutoff
 
 
-def _prune_logs(directory: Path, cutoff: float) -> int:
-    """Remove `*.log` files in `directory` last modified before `cutoff`; returns how many."""
+def _prune_logs(directory: Path, cutoff: float, keep: Collection[Path]) -> int:
+    """Remove `*.log` files in `directory` last modified before `cutoff`, except those in `keep`; returns how many."""
     removed = 0
     for path in directory.glob("*.log"):
+        if path in keep:
+            continue
         try:
             if path.stat().st_mtime < cutoff:
                 path.unlink()

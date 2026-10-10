@@ -1,4 +1,6 @@
 import asyncio
+import contextlib
+import logging
 import os
 import secrets
 import signal
@@ -11,10 +13,10 @@ from pathlib import Path
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
-from dev_link_mcp.audit import AuditStore
+from dev_link_mcp.audit import AuditStore, StreamRedactor
 from dev_link_mcp.config import Config
 from dev_link_mcp.patterns import PatternStuck
-from dev_link_mcp.processes import ProcessManager, _port_open
+from dev_link_mcp.processes import LogPump, ProcessManager, _port_open
 from dev_link_mcp.sandbox import Sandbox
 
 # Leftover processes are found by scanning /proc, which only Linux has.
@@ -402,3 +404,135 @@ async def test_failed_registration_kills_the_started_process(pm, workspace, monk
         await asyncio.sleep(0.1)
     else:
         pytest.fail(f"{marker} survived a failed start")
+
+
+async def test_token_in_process_output_never_reaches_the_log_file(pm, rt, workspace):
+    token = rt.config.server.token
+    head, rest = token[:10], token[10:]
+    # Whole, then split over two quick writes, then next to bytes that are not UTF-8.
+    command = (
+        f"printf 'whole-%s-end\\n' {token}; printf %s {head}; printf '%s-split\\n' {rest};"
+        f" printf '\\377\\376%s\\n' {token}"
+    )
+    proc = await pm.start(command, cwd=workspace)
+    async with asyncio.timeout(10):
+        await proc.watcher
+    raw = proc.log_path.read_bytes()
+    assert token.encode() not in raw
+    assert raw == b"whole-***-end\n***-split\n\xff\xfe***\n"
+    text, offset = pm.read_log(proc.id)
+    assert text.startswith("whole-***-end\n***-split\n") and offset == len(raw)
+    assert token not in rt.audit.get(proc.event_id)["result"]
+
+
+@needs_proc
+async def test_stop_during_heavy_output_leaves_no_copy_behind(pm, workspace):
+    proc = await pm.start("yes dev-link-flood", cwd=workspace)
+    await _wait_log(pm, proc.id, "dev-link-flood\n")
+    await pm.stop(proc.id)
+    assert proc.pump._task is not None and proc.pump._task.done()
+    open_files = {os.readlink(fd) for fd in Path("/proc/self/fd").iterdir() if fd.is_symlink()}
+    assert str(proc.log_path) not in open_files
+    size = proc.log_path.stat().st_size
+    await asyncio.sleep(0.3)
+    assert proc.log_path.stat().st_size == size
+
+
+async def test_output_of_a_background_job_does_not_hold_up_exit_detection(tmp_path, workspace):
+    # Unsandboxed, the job keeps the output pipe open after bash exits, until the exit cleanup
+    # kills it; bwrap would end it together with bash.
+    config = Config(workspace=workspace, state_dir=tmp_path / "state-bg").finalize()
+    config.sandbox.backend = "none"
+    audit = AuditStore(config.state_dir, secrets=[config.server.token], result_bytes=1000)
+    pm = ProcessManager(Sandbox(config), audit, config.state_dir, max_processes=4)
+    try:
+        proc = await pm.start(f"sleep 3131 & echo started-{config.server.token}", cwd=workspace)
+        async with asyncio.timeout(5):
+            await proc.watcher
+        assert proc.exit_code == 0 and pm.read_log(proc.id)[0] == "started-***\n"
+    finally:
+        await pm.shutdown()
+        audit.close()
+
+
+async def test_a_cancelled_stop_still_records_the_exit(tmp_path, workspace, monkeypatch):
+    config = Config(workspace=workspace, state_dir=tmp_path / "state-cancel").finalize()
+    config.sandbox.backend = "none"
+    audit = AuditStore(config.state_dir, secrets=[config.server.token], result_bytes=1000)
+    sandbox = Sandbox(config)
+    # A job that escaped the exit cleanup keeps the output pipe open, so the watcher spends
+    # PUMP_DRAIN_S draining it after bash exits.
+    monkeypatch.setattr(sandbox, "reap", lambda pid: None)
+    pm = ProcessManager(sandbox, audit, config.state_dir, max_processes=4)
+    job = None
+    try:
+        proc = await pm.start("setsid sleep 3133 & echo job=$!; sleep 3134", cwd=workspace)
+        job = int((await _wait_log(pm, proc.id, "\n")).strip().removeprefix("job="))
+        stop = asyncio.create_task(pm.stop(proc.id, grace_s=1))
+        async with asyncio.timeout(5):
+            while proc.proc.returncode is None:
+                await asyncio.sleep(0.02)
+        stop.cancel()  # bash is gone and the watcher is still draining the pipe
+        with contextlib.suppress(asyncio.CancelledError):
+            await stop
+        assert stop.cancelled()
+        async with asyncio.timeout(5):
+            await asyncio.shield(proc.watcher)
+        assert proc.exit_code == -signal.SIGTERM
+        assert audit.get(proc.event_id)["status"] == "ok"
+        assert await pm.stop(proc.id) == -signal.SIGTERM
+    finally:
+        if job is not None:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(job, signal.SIGKILL)
+        await pm.shutdown()
+        audit.close()
+
+
+async def _pump(log_path: Path, secrets_: list[str]) -> tuple[LogPump, int]:
+    """A started LogPump and a write end of its pipe that the test owns."""
+    pump = LogPump(log_path, StreamRedactor(secrets_))
+    write_fd = os.dup(pump.process_end.fileno())
+    await pump.start()
+    return pump, write_fd
+
+
+async def test_held_output_reaches_the_log_once_the_process_pauses(tmp_path):
+    token = secrets.token_urlsafe(24)
+    log_path = tmp_path / "pump.log"
+    pump, write_fd = await _pump(log_path, [token])
+    try:
+        # A token split over two quick writes is still caught.
+        os.write(write_fd, f"a {token[:9]}".encode())
+        await asyncio.sleep(0.02)
+        os.write(write_fd, f"{token[9:]} b\n".encode())
+        # A prompt that happens to end like the start of the token must not wait for more output.
+        os.write(write_fd, f"Enter value: {token[:3]}".encode())
+        expected = f"a *** b\nEnter value: {token[:3]}".encode()
+        async with asyncio.timeout(0.6):
+            while log_path.read_bytes() != expected:
+                await asyncio.sleep(0.02)
+    finally:
+        os.close(write_fd)
+        await pump.close(1)
+    assert log_path.read_bytes() == expected
+
+
+@pytest.mark.skipif(not Path("/dev/full").exists(), reason="needs /dev/full to fail log writes")
+async def test_log_pump_keeps_draining_when_the_log_cannot_be_written(tmp_path, caplog):
+    pump, write_fd = await _pump(Path("/dev/full"), [])
+    data = b"x" * (1 << 20)  # far more than a pipe holds, so a pump that stopped reading would block the writer
+
+    def write_all() -> None:
+        with os.fdopen(write_fd, "wb") as out:
+            out.write(data)
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="dev_link_mcp.processes"):
+            async with asyncio.timeout(10):
+                await asyncio.to_thread(write_all)
+            await pump.close(5)
+    finally:
+        await pump.close(0)
+    warnings = [r for r in caplog.records if "cannot write process log" in r.getMessage()]
+    assert len(warnings) == 1

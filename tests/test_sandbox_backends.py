@@ -2,8 +2,12 @@
 
 import asyncio
 import logging
+import os
 import shutil
+import signal
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -274,3 +278,54 @@ async def test_kill_tree_empties_the_scope_of_a_spawned_process(config, tmp_path
     await asyncio.sleep(0.3)
     assert _sleepers("3080", "3081") == []
     assert _limit_scopes() == []
+
+
+# Spawns a command with a memory limit whose background job leaves the group with setsid, then
+# waits to be SIGKILLed.
+_SPAWN_IN_SCOPE_THEN_WAIT = """\
+import asyncio, sys
+from pathlib import Path
+from dev_link_mcp.config import Config
+from dev_link_mcp.sandbox import Sandbox
+
+async def main():
+    ws, state = Path(sys.argv[1]), Path(sys.argv[2])
+    config = Config(workspace=ws, state_dir=state, sandbox={"backend": "none"}, limits={"memory_mb": 256}).finalize()
+    sb = Sandbox(config)
+    with (state / "spawn.log").open("ab") as log_file:
+        await sb.spawn(
+            sb.shell_argv("setsid sleep 3091 </dev/null >/dev/null 2>&1 & sleep 3090"), cwd=ws, log_file=log_file
+        )
+    print("started", flush=True)
+    await asyncio.sleep(300)
+
+asyncio.run(main())
+"""
+
+
+@needs_systemd
+def test_a_killed_server_empties_the_scope_of_an_unconfined_process(tmp_path, workspace):
+    server = subprocess.Popen(
+        [sys.executable, "-c", _SPAWN_IN_SCOPE_THEN_WAIT, str(workspace), str(tmp_path / "state")],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert server.stdout is not None
+        assert server.stdout.readline().strip() == "started"
+        for _ in range(50):
+            if len(_sleepers("3090", "3091")) == 2:
+                break
+            time.sleep(0.05)
+        assert len(_sleepers("3090", "3091")) == 2
+    finally:
+        server.kill()
+        server.wait()
+    for _ in range(50):
+        if not _sleepers("3090", "3091"):
+            break
+        time.sleep(0.1)
+    leftover = _sleepers("3090", "3091")
+    for pid in leftover:
+        os.kill(pid, signal.SIGKILL)
+    assert leftover == []

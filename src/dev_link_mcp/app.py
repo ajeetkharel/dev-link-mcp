@@ -6,9 +6,11 @@ import asyncio
 import contextlib
 import hmac
 import json
+import logging
 import os
 import sys
 from collections.abc import Callable
+from pathlib import Path
 from types import FrameType
 from typing import Any
 from urllib.parse import urlsplit
@@ -21,12 +23,15 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from dev_link_mcp import __version__
+from dev_link_mcp.audit import redact
 from dev_link_mcp.config import LOOPBACK_HOSTS, Config
 from dev_link_mcp.middleware import AuditMiddleware
 from dev_link_mcp.private import open_private
 from dev_link_mcp.runtime import Runtime
 from dev_link_mcp.tools import Toolset, register_groups
 from dev_link_mcp.web import add_dashboard_routes
+
+log = logging.getLogger(__name__)
 
 INSTRUCTIONS = """\
 dev-link-mcp is a development environment for one workspace folder. Work as you would in
@@ -154,12 +159,16 @@ def connection_info(config: Config) -> dict[str, Any]:
     return info
 
 
-def _banner(config: Config, sandbox: str, groups_tools: int) -> str:
+def _banner(config: Config, sandbox: str, groups_tools: int, conn_file: Path, *, show_token: bool) -> str:
+    """The startup summary. Without `show_token`, every copy of the token is *** and a line
+    points to `conn_file`, the connection file, which has it; with auth `none` there is no token."""
     info = connection_info(config)
     add = f"claude mcp add --transport http dev-link {info['mcp_url']}"
     if config.server.auth == "bearer":
         add += f' --header "Authorization: Bearer {config.server.token}"'
-    return "\n".join(
+    hide = not show_token and bool(config.server.token)
+    hidden = [f"  token     : hidden because this output is not a terminal; see {conn_file}"] if hide else []
+    text = "\n".join(
         [
             "",
             "  dev-link-mcp ready",
@@ -177,6 +186,7 @@ def _banner(config: Config, sandbox: str, groups_tools: int) -> str:
                 if config.server.public_url
                 else []
             ),
+            *hidden,
             f"  logs      : {config.state_dir}",
             *(
                 ["", "  WARNING: anyone with the public URL can run commands in this workspace."]
@@ -189,6 +199,11 @@ def _banner(config: Config, sandbox: str, groups_tools: int) -> str:
             "",
         ]
     )
+    return redact(text, [config.server.token]) if hide else text
+
+
+class ServeAborted(Exception):
+    """The server shut itself down because something it depends on failed; the message says what."""
 
 
 class _Server(uvicorn.Server):
@@ -196,17 +211,25 @@ class _Server(uvicorn.Server):
 
     uvicorn checks for shutdown every 0.1 s, so an idle server wakes ten times a second. This one
     ticks once a second, which still refreshes the Date header on time, and wakes at once when a
-    signal asks it to stop.
+    signal asks it to stop. Each tick also calls `abort_when`; a reason from it stops the server
+    and is kept in `aborted`.
     """
 
     _loop: asyncio.AbstractEventLoop | None = None
     _wake: asyncio.Event | None = None
+    abort_when: Callable[[], str | None] | None = None
+    aborted: str | None = None
 
     async def main_loop(self) -> None:
         self._loop = asyncio.get_running_loop()
         self._wake = asyncio.Event()
         counter = 0
         while not await self.on_tick(counter):
+            if self.abort_when is not None and (reason := self.abort_when()) is not None:
+                log.error("shutting down: %s", reason)
+                self.aborted = reason
+                self.should_exit = True
+                break
             # on_tick refreshes the Date header when counter % 10 == 0, so on every tick here.
             counter += 10
             with contextlib.suppress(TimeoutError):
@@ -219,36 +242,52 @@ class _Server(uvicorn.Server):
             self._loop.call_soon_threadsafe(self._wake.set)
 
 
-async def serve(config: Config, *, on_shutdown: Callable[[], None] | None = None) -> None:
+async def serve(
+    config: Config,
+    *,
+    on_shutdown: Callable[[], None] | None = None,
+    abort_when: Callable[[], str | None] | None = None,
+) -> None:
     """Run the server until it is told to stop.
 
     Writes `state_dir/connection.json` (0600: the URLs plus the workspace and this PID) once the
     tools are registered, and removes it on exit. `on_shutdown` runs first when the server
     stops, before background processes and tool groups are shut down; the CLI stops the tunnel
-    there so nothing stays reachable while the rest winds down. Raises like build().
+    there so nothing stays reachable while the rest winds down. `abort_when` is called about
+    once a second while the server runs; when it returns a reason, the server shuts down as for
+    a signal and then raises ServeAborted with that reason. The CLI uses it to notice a dead
+    tunnel. Otherwise raises like build().
     """
     app, rt, toolset = await build(config)
     assert config.state_dir is not None
     conn_file = config.state_dir / "connection.json"
+    server: _Server | None = None
     try:
         with os.fdopen(open_private(conn_file), "w") as f:
             json.dump({**connection_info(config), "workspace": str(config.workspace), "pid": os.getpid()}, f, indent=2)
         tool_count = sum(len(names) for names in toolset.tools.values())
-        print(_banner(config, rt.sandbox.backend.name, tool_count), file=sys.stderr, flush=True)
+        # Output that is not a terminal usually lands in a file (`dev-link start` writes server.log),
+        # where the token would outlive the run; on a terminal the banner is how the user gets it.
+        banner = _banner(config, rt.sandbox.backend.name, tool_count, conn_file, show_token=sys.stderr.isatty())
+        print(banner, file=sys.stderr, flush=True)
         # access_log is off because request lines would contain the path token. SSE streams (an open
         # dashboard tab, an MCP client's GET stream) never end on their own, so without a shutdown
-        # timeout uvicorn waits for them forever and Ctrl+C cannot stop the server.
+        # timeout uvicorn waits for them forever and Ctrl+C cannot stop the server. log_config=None
+        # leaves uvicorn's loggers to the root handlers the CLI sets up, which redact the token.
         server = _Server(
             uvicorn.Config(
                 app,
                 host=config.server.host,
                 port=config.server.port,
                 log_level=config.log_level.lower(),
+                log_config=None,
                 access_log=False,
                 timeout_graceful_shutdown=3,
             )
         )
-        await server.serve()
+        server.abort_when = abort_when
+        async with rt.prune_periodically():
+            await server.serve()
     finally:
         try:
             if on_shutdown is not None:
@@ -258,5 +297,8 @@ async def serve(config: Config, *, on_shutdown: Callable[[], None] | None = None
             # Groups such as the browser hold processes that must not outlive the server. Both run at
             # once so their grace periods overlap within the 10 s before `dev-link stop` sends SIGKILL.
             await asyncio.gather(rt.processes.shutdown(), toolset.shutdown())
-            rt.audit.record("server", "stop")
+            aborted = server.aborted if server is not None else None
+            rt.audit.record("server", "stop", ok=aborted is None, error=aborted)
             rt.audit.close()
+    if aborted is not None:
+        raise ServeAborted(aborted)

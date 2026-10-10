@@ -335,7 +335,7 @@ dev = [
 requires-dist = [
     { name = "dev-link-mcp", extras = ["browser", "code"], marker = "extra == 'all'" },
     { name = "httpx", specifier = ">=0.28.1" },
-    { name = "mcp", specifier = ">=2.3.0" },
+    { name = "mcp", specifier = ">=2.3.0,<3" },
     { name = "playwright", marker = "extra == 'browser'", specifier = ">=1.63.0" },
     { name = "pydantic", specifier = ">=2.13.5" },
     { name = "pyyaml", specifier = ">=6.0.3" },

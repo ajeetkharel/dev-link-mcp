@@ -6,6 +6,7 @@ import argparse
 import fcntl
 import importlib.metadata
 import json
+import logging
 import os
 import shutil
 import signal
@@ -26,6 +27,7 @@ from dev_link_mcp.audit import AuditReader, AuditStore
 from dev_link_mcp.cli import doctor, instance, main
 from dev_link_mcp.cli import serve as serve_cmd
 from dev_link_mcp.cli.main import parse_args, server_parser
+from dev_link_mcp.cli.tunnel import Tunnel
 from dev_link_mcp.config import load_config
 from dev_link_mcp.config.schema import schema
 from dev_link_mcp.private import open_private
@@ -249,6 +251,9 @@ def test_start_status_url_logs_stop(tmp_path, cli_env):
 
         logs = run(cli_env, "logs", "server", str(ws_a), "-n", "50")
         assert logs.returncode == 0 and "Uvicorn running on" in logs.stdout
+        # The server's output goes to server.log, not a terminal, so its banner hides the token.
+        server_log_b = next(state_a.glob("ws-b-*/server.log")).read_text()
+        assert token not in server_log_b and "/mcp/***" in server_log_b
         audit = run(cli_env, "logs", "audit", str(ws_a))
         assert audit.returncode == 0 and "server:start" in audit.stdout
 
@@ -326,6 +331,62 @@ def test_serve_with_tunnel_publishes_and_stops_it(tmp_path, workspace, cli_env):
             os.kill(tunnel_pid, signal.SIGKILL)
 
 
+def _serve_with_fake_tunnel(
+    tmp_path: Path, workspace: Path, cli_env: dict[str, str]
+) -> tuple[subprocess.Popen[str], int]:
+    """A foreground `serve --tunnel` with the fake cloudflared, once it is ready: (server, cloudflared pid)."""
+    cli_env["PATH"] = f"{_fake_cloudflared(tmp_path, FAKE_CLOUDFLARED)}{os.pathsep}{cli_env['PATH']}"
+    state = tmp_path / "s"
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    proc = subprocess.Popen(
+        [
+            *(sys.executable, "-m", "dev_link_mcp", "serve", str(workspace), "--state-dir", str(state)),
+            *("--port", str(port), "--tunnel", *sandbox_flags()),
+        ],
+        env=cli_env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.monotonic() + 60
+    while not (state / "connection.json").exists():
+        if proc.poll() is not None or time.monotonic() >= deadline:
+            proc.kill()
+            raise AssertionError(proc.communicate()[1])
+        time.sleep(0.1)
+    return proc, int((tmp_path / "cloudflared.pid").read_text())
+
+
+def test_sigkill_of_a_foreground_server_stops_its_tunnel(tmp_path, workspace, cli_env):
+    proc, tunnel_pid = _serve_with_fake_tunnel(tmp_path, workspace, cli_env)
+    try:
+        proc.kill()
+        proc.wait()
+        assert _wait_gone(tunnel_pid, 5)
+    finally:
+        if not _gone(tunnel_pid):
+            os.kill(tunnel_pid, signal.SIGKILL)
+
+
+def test_a_tunnel_that_dies_mid_run_stops_the_server(tmp_path, workspace, cli_env):
+    proc, tunnel_pid = _serve_with_fake_tunnel(tmp_path, workspace, cli_env)
+    try:
+        os.kill(tunnel_pid, signal.SIGKILL)
+        assert proc.wait(15) == 1
+        err = proc.stderr.read() if proc.stderr else ""
+        assert "dev-link: cloudflared exited with code -9, so https://fake-tunnel-test" in err
+        assert "trycloudflare.com no longer works; last lines of" in err
+        assert "INF Requesting new quick Tunnel" in err
+        assert not (tmp_path / "s" / "connection.json").exists()
+        assert instance.holder(tmp_path / "s") is None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
 def test_a_tunnel_that_exits_early_reports_its_log(tmp_path, workspace, monkeypatch, capsys):
     monkeypatch.setenv("PATH", f"{_fake_cloudflared(tmp_path, BROKEN_CLOUDFLARED)}{os.pathsep}{os.environ['PATH']}")
     with pytest.raises(SystemExit) as exc:
@@ -371,6 +432,27 @@ def test_doctor_passes_with_only_warnings(tmp_path, workspace, monkeypatch, caps
     assert main(["doctor", str(workspace), "--state-dir", str(tmp_path / "s"), "--no-sandbox"]) == 0
     out = capsys.readouterr().out
     assert "warn  cloudflared" in out and "fix: install cloudflared" in out
+
+
+def test_doctor_fails_when_the_sandbox_would_mount_the_state_dir(tmp_path, workspace, capsys):
+    state = tmp_path / "s"
+    conf = tmp_path / "c.yaml"
+    conf.write_text(f"sandbox:\n  rw_paths: [{state / 'shared'}]\n")
+    assert main(["doctor", str(workspace), "--state-dir", str(state), "-c", str(conf)]) == 1
+    lines = capsys.readouterr().out.splitlines()
+    sandbox = next(i for i, line in enumerate(lines) if line.split()[1:2] == ["sandbox"])
+    assert lines[sandbox].startswith("fail") and "sandbox.rw_paths entry" in lines[sandbox]
+    assert "move state_dir" in lines[sandbox + 1]
+
+
+def test_doctor_fails_when_a_mount_source_is_inside_a_writable_mount(tmp_path, workspace, capsys):
+    conf = tmp_path / "c.yaml"
+    conf.write_text(f"sandbox:\n  rw_paths: [{workspace / 'out'}]\n")
+    assert main(["doctor", str(workspace), "--state-dir", str(tmp_path / "s"), "-c", str(conf)]) == 1
+    lines = capsys.readouterr().out.splitlines()
+    sandbox = next(i for i, line in enumerate(lines) if line.split()[1:2] == ["sandbox"])
+    assert lines[sandbox].startswith("fail") and "inside the writable mount workspace" in lines[sandbox]
+    assert "fix:" in lines[sandbox + 1] and "out of" in lines[sandbox + 1]
 
 
 def test_doctor_reports_a_bad_config(tmp_path, workspace, capsys):
@@ -644,6 +726,80 @@ def test_doctor_names_the_extra_for_a_missing_group(tmp_path, workspace, monkeyp
     assert "warn  browser      playwright not installed" in out
     assert "fix: pip install 'dev-link-mcp[browser]'" in out
     assert "fix: pip install 'dev-link-mcp[code]'" in out
+
+
+def test_server_logging_redacts_the_token(config, monkeypatch, capsys):
+    root = logging.getLogger()
+    monkeypatch.setattr(root, "handlers", [])
+    monkeypatch.setattr(root, "level", root.level)
+    serve_cmd.configure_logging(config)
+    token = config.server.token
+    try:
+        raise RuntimeError(f"no route for /ui/{token}/")
+    except RuntimeError:
+        logging.getLogger("dev_link_mcp.test").exception("request to /mcp/%s failed", token)
+    err = capsys.readouterr().err
+    assert token not in err
+    assert "request to /mcp/*** failed" in err and "RuntimeError: no route for /ui/***/" in err
+
+
+def test_server_logging_redacts_arguments_that_do_not_fit_the_format(config, monkeypatch, capsys):
+    root = logging.getLogger()
+    monkeypatch.setattr(root, "handlers", [])
+    monkeypatch.setattr(root, "level", root.level)
+    serve_cmd.configure_logging(config)
+    token = config.server.token
+    # Formatting fails here, and logging's error report would print the raw arguments to stderr.
+    logging.getLogger("dev_link_mcp.test").warning("bad format %d", f"/mcp/{token}")
+    err = capsys.readouterr().err
+    assert token not in err
+    assert "bad format %d ('/mcp/***',)" in err and "Logging error" not in err
+
+
+def test_tunnel_log_hides_the_token(tmp_path, monkeypatch):
+    token = "tunnel-token-0123456789abcdef"
+    # cloudflared logs the full URL of a request it could not pass on, path token included.
+    script = FAKE_CLOUDFLARED.replace(
+        "exec sleep 300",
+        f'echo "ERR Request failed error=\\"connection refused\\" dest=https://fake-tunnel-test.trycloudflare.com/mcp/{token}"\n'
+        "exec sleep 300",
+    )
+    monkeypatch.setenv("PATH", f"{_fake_cloudflared(tmp_path, script)}{os.pathsep}{os.environ['PATH']}")
+    log_path = tmp_path / "tunnel.log"
+    tunnel = Tunnel.start("http://127.0.0.1:1", log_path, secrets=[token])
+    try:
+        assert tunnel.url == "https://fake-tunnel-test.trycloudflare.com"
+    finally:
+        tunnel.stop()
+    text = log_path.read_text()
+    assert token not in text and "trycloudflare.com/mcp/***" in text
+    assert stat.S_IMODE(log_path.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(not Path("/dev/full").exists(), reason="needs /dev/full to fail log writes")
+def test_tunnel_log_copy_keeps_reading_after_a_write_failure():
+    from dev_link_mcp.audit import StreamRedactor
+    from dev_link_mcp.cli.tunnel import _copy
+
+    read_fd, write_fd = os.pipe()
+    source = open(read_fd, "rb", buffering=0)  # noqa: SIM115 - _copy closes it
+    log_file = open("/dev/full", "wb", buffering=0)  # noqa: SIM115 - _copy closes it
+    copier = threading.Thread(target=_copy, args=(source, log_file, StreamRedactor([])), daemon=True)
+    copier.start()
+    written: list[int] = []
+
+    def write() -> None:
+        # Far more than a pipe holds, so it only all goes through if the copy keeps reading.
+        with open(write_fd, "wb", buffering=0) as out:
+            written.append(out.write(b"x" * (1 << 20)))
+
+    writer = threading.Thread(target=write, daemon=True)
+    writer.start()
+    writer.join(10)
+    copier.join(10)
+    assert not writer.is_alive() and not copier.is_alive()
+    assert written == [1 << 20]
+    assert source.closed and log_file.closed
 
 
 def test_cli_is_installed_under_both_names():

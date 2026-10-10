@@ -7,7 +7,8 @@ import time
 
 import pytest
 
-from dev_link_mcp.audit import AuditStore
+from dev_link_mcp import audit as audit_module
+from dev_link_mcp.audit import AuditStore, SecretLogFilter, StreamRedactor
 from dev_link_mcp.config import Config
 from dev_link_mcp.runtime import Runtime
 
@@ -97,6 +98,44 @@ def test_redact_helper(store):
     assert store.redact(f"a {TOKEN} b") == "a *** b"
     # The empty secret is ignored rather than inserting *** between every character.
     assert store.redact("abc") == "abc"
+
+
+def test_stream_redactor_catches_a_secret_split_anywhere():
+    # Bytes that are not UTF-8 pass through untouched.
+    data = f"a{TOKEN}b{TOKEN}".encode() + b"\xff\xfe\xe2\x82 end"
+    expected = b"a***b***\xff\xfe\xe2\x82 end"
+    for cut in range(len(data) + 1):
+        redactor = StreamRedactor([TOKEN, ""])
+        assert redactor.feed(data[:cut]) + redactor.feed(data[cut:]) + redactor.flush() == expected, cut
+    redactor = StreamRedactor([TOKEN])
+    assert b"".join(redactor.feed(data[i : i + 1]) for i in range(len(data))) + redactor.flush() == expected
+
+
+def test_stream_redactor_holds_back_only_what_could_start_a_secret():
+    redactor = StreamRedactor([TOKEN])
+    # A line such as a "ready" banner must not wait for more output.
+    assert redactor.feed(b"ready on :3000\n") == b"ready on :3000\n"
+    assert redactor.feed(b"x" + TOKEN[:5].encode()) == b"x"
+    assert redactor.feed(b"!") == TOKEN[:5].encode() + b"!"
+    assert redactor.feed(TOKEN[:-1].encode()) == b""
+    # The end of the output is not a secret, so it is written as it is.
+    assert redactor.flush() == TOKEN[:-1].encode()
+    assert redactor.flush() == b""
+
+
+def test_log_filter_redacts_messages_arguments_and_tracebacks(caplog):
+    logger = logging.getLogger("dev_link_mcp.test_redaction")
+    caplog.handler.addFilter(SecretLogFilter([TOKEN]))
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        logger.info("url /mcp/%s/x", TOKEN)
+        logger.warning(f"plain {TOKEN}")
+        try:
+            raise ValueError(f"bad path /ui/{TOKEN}")
+        except ValueError:
+            logger.exception("request failed")
+    assert TOKEN not in caplog.text
+    assert "url /mcp/***/x" in caplog.text and "plain ***" in caplog.text
+    assert "ValueError: bad path /ui/***" in caplog.text
 
 
 def test_result_clipping(store):
@@ -396,11 +435,11 @@ def test_failed_jsonl_open_closes_the_temp_file(store, monkeypatch):
     assert [json.loads(line)["id"] for line in store.jsonl_path.read_text().splitlines()][-1] == after
 
 
-def test_prune_vacuums_after_deleting(store, monkeypatch):
+def test_prune_vacuums_after_deleting_when_asked(store, monkeypatch):
     _record_old(store, monkeypatch, "old")
     statements: list[str] = []
     store._db.set_trace_callback(statements.append)
-    store.prune(30, store.db_path.parent / "processes")
+    store.prune(30, store.db_path.parent / "processes", vacuum=True)
     store._db.set_trace_callback(None)
     assert "VACUUM" in statements
     assert (store.db_path.parent / "audit.sqlite3-wal").stat().st_size == 0
@@ -412,10 +451,33 @@ def test_prune_logs_and_survives_a_failed_vacuum(store, monkeypatch, caplog):
     # A statement still stepping on the same connection makes SQLite refuse VACUUM.
     pending = store._db.execute("SELECT id FROM events")
     pending.fetchone()
-    pruned = store.prune(30, store.db_path.parent / "processes")
+    pruned = store.prune(30, store.db_path.parent / "processes", vacuum=True)
     pending.close()
     assert pruned.events == 1 and store.get(old) is None and store.get(new) is not None
     assert "VACUUM failed" in caplog.text and "statements in progress" in caplog.text
+
+
+def test_prune_does_not_vacuum_by_default(store, monkeypatch):
+    """VACUUM rewrites the whole file under the store lock, so passes while serving skip it."""
+    _record_old(store, monkeypatch, "old")
+    statements: list[str] = []
+    store._db.set_trace_callback(statements.append)
+    assert store.prune(30, store.db_path.parent / "processes").events == 1
+    store._db.set_trace_callback(None)
+    assert not any("VACUUM" in s or "wal_checkpoint" in s for s in statements)
+
+
+def test_prune_deletes_in_batches(store, monkeypatch):
+    """Each batch is one short hold of the store lock, so writes get in between them."""
+    old = [_record_old(store, monkeypatch, "old") for _ in range(5)]
+    new = store.record("tool", "new")
+    monkeypatch.setattr(audit_module, "_PRUNE_BATCH", 2)
+    deletes: list[str] = []
+    store._db.set_trace_callback(lambda s: deletes.append(s) if s.startswith("DELETE") else None)
+    assert store.prune(30, store.db_path.parent / "processes").events == 5
+    store._db.set_trace_callback(None)
+    assert len(deletes) == 3
+    assert all(store.get(i) is None for i in old) and store.get(new) is not None
 
 
 def test_prune_removes_old_process_logs(store, tmp_path):

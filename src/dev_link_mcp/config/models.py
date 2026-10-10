@@ -109,11 +109,13 @@ class SandboxConfig(Section):
             "~/.deno",
         ],
         description="Host paths mounted read-only inside the sandbox in addition to the system folders. "
-        "Missing paths are skipped, so one config works across machines.",
+        "Missing paths are skipped, so one config works across machines. None may lie inside the workspace "
+        "or a `rw_paths` entry, where the agent could swap it for a symlink.",
     )
     rw_paths: list[str] = Field(
         default_factory=list,
-        description="Host paths mounted read-write. Anything here is reachable by the agent.",
+        description="Host paths mounted read-write. Anything here is reachable by the agent. None may lie inside "
+        "the workspace or another entry.",
     )
     env_passthrough: list[str] = Field(
         default_factory=lambda: ["LANG", "LC_ALL", "TZ", "JAVA_HOME", "MAVEN_HOME", "GOPATH", "NVM_DIR"],
@@ -171,7 +173,8 @@ class AuditConfig(Section):
         default=30,
         ge=1,
         description="Audit events and background process logs older than this many days are deleted when the "
-        "server starts. `null` keeps everything.",
+        "server starts and once a day while it runs. Logs of processes the server still lists are kept. "
+        "`null` keeps everything.",
     )
 
 
@@ -195,8 +198,9 @@ class Config(Section):
     )
     state_dir: LaxPath | None = Field(
         default=None,
-        description="Where logs, the audit store and the sandbox home live. Must be outside the workspace. "
-        "Default: `$XDG_STATE_HOME/dev-link-mcp/<folder name>-<hash>`.",
+        description="Where logs, the audit store and the sandbox home live. Must be outside the workspace and, "
+        "with a sandbox, outside every folder it mounts (system folders, `sandbox.ro_paths`, `sandbox.rw_paths`) "
+        "with none of them inside it. Default: `$XDG_STATE_HOME/dev-link-mcp/<folder name>-<hash>`.",
     )
     log_level: LogLevel = Field(default="INFO", description="Server log level. Lower case is accepted.")
     server: ServerConfig = Field(default_factory=ServerConfig, description="Network address and authentication.")
@@ -228,7 +232,8 @@ class Config(Section):
         return self._sources
 
     def finalize(self) -> Config:
-        """Resolve paths, generate the token and validate. Returns self for chaining.
+        """Resolve paths, generate the token (or clear it with auth `none`) and validate. Returns
+        self for chaining.
 
         Raises ValueError for a missing workspace, a workspace that is home or contains it, a bad
         token, or a state directory inside the workspace (the agent could then rewrite its own
@@ -241,7 +246,10 @@ class Config(Section):
         if Path.home().resolve().is_relative_to(self.workspace):
             raise ValueError("refusing to expose /, your home directory, or a parent of it as the workspace")
         server = self.server
-        if server.auth != "none" and not server.token:
+        if server.auth == "none":
+            # Every log redacts the token, so a leftover one would turn its text into *** everywhere.
+            server.token = ""
+        elif not server.token:
             server.token = secrets.token_urlsafe(24)
         if server.auth != "none" and len(server.token) < 16:
             raise ValueError("token must be at least 16 characters")

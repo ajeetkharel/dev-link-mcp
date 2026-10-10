@@ -139,8 +139,9 @@ def stop(state_dir: Path, pid: int, *, grace_s: float = 10) -> None:
     """Stop the server holding the lock: SIGTERM, then SIGKILL after `grace_s` seconds.
 
     A server started by `dev-link start` leads its own session, so its whole process group is
-    signalled, which includes the tunnel. Any other holder (a foreground `serve`) gets the
-    signal alone, so a shell pipeline it is part of is left alone. Returns once the lock is
+    signalled. Any other holder (a foreground `serve`) gets the signal alone, so a shell
+    pipeline it is part of is left alone. The tunnel has its own session either way; the server
+    stops it on SIGTERM, and the orphan guard kills it after SIGKILL. Returns once the lock is
     released; raises CliError if it still is not 5 s after SIGKILL.
     """
     try:

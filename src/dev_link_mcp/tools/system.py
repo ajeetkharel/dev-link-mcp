@@ -59,8 +59,10 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
                     if cfg.sandbox.network
                     else [
                         "With network blocked each command has its own network namespace, so a server started"
-                        " with start_process cannot be reached by http_request, the browser tools or the"
-                        " wait_for_port option of start_process."
+                        " with start_process cannot be reached from other commands or tools: the wait_for_port"
+                        " option of start_process and the port option of wait_for_process are refused, and"
+                        " http_request, fetch_url and download_file refuse every URL. The browser only opens"
+                        " about:blank, its pages can load only data: and blob: URLs, and WebRTC is turned off."
                     ]
                 ),
                 "Anything goes inside the workspace. Outside it, system dirs are read-only and the rest"

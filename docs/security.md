@@ -16,16 +16,20 @@ URL works from anywhere on the internet. Treat both like a password.
 - The dashboard URL contains the same token. In `bearer` mode the MCP endpoint wants an
   `Authorization` header, but the dashboard still uses the token in its path, because a
   browser cannot add a header to a page load.
-- The token is written to `connection.json` and to the banner in `server.log` (both 0600 in the
-  state dir). It is replaced with `***` in the audit log. Request logging is off, so it does not
-  end up in access logs.
+- The token is written only to `connection.json` (0600 in the state dir), which `dev-link url`
+  reads. Everywhere else it is replaced with `***` before it is written: the audit log,
+  background process logs, `server.log`, `tunnel.log` and every server log line. The startup
+  banner shows the token only when its output is a terminal. Request logging is off. A
+  background process that stops for more than 0.2 s in the middle of printing the token leaves
+  the part before the pause in its log.
 - The server speaks plain HTTP. On the default `127.0.0.1` that stays on your machine. If you
   bind to a LAN address with `--host`, the token crosses the network unencrypted.
 - `--tunnel` runs a Cloudflare quick tunnel. TLS ends at Cloudflare, so Cloudflare handles the
   token and all traffic in clear text.
 - `auth: none` is only accepted on a loopback host (`127.0.0.1`, `localhost`, `::1`). The server
   refuses to start with `none` on any other host, together with `public_url` or `allowed_hosts`,
-  or with `--tunnel`. Even on loopback, every local user and process can then use the server,
+  or with `--tunnel`. A configured token is ignored with `none`. Even on loopback, every local
+  user and process can then use the server,
   including agents of other dev-link servers on this machine whose network is on.
 
 ## Network
@@ -48,11 +52,17 @@ because each command has its own loopback.
 
 Some tools do not run in the sandbox, and the network setting means something different for them:
 
-- `http_request`, `fetch_url`, `download_file` and the browser run in the server process. With
-  the network off they may only reach loopback addresses, and that is the host's loopback. So
-  they can still reach services listening on `127.0.0.1` on your machine. The HTTP tools resolve
-  `localhost` and `*.localhost` names themselves and connect only if every address is loopback.
-- The docker group ignores `sandbox.network`: containers get Docker's normal networking.
+- `http_request`, `fetch_url`, `download_file` and the browser run in the server process, where
+  loopback is the host's loopback. With the network off the HTTP tools refuse every request, and
+  the browser loads only `about:`, `data:` and `blob:` URLs, with WebRTC turned off. Loopback and
+  `localhost` are refused too, so they cannot reach services on your machine. The process tools
+  refuse to wait for a port, because that probe would also hit the host's loopback.
+- With the network off, docker containers run with `--network none`. Compose services share
+  internal networks whose gateway is isolated from the host, so they reach each other but not
+  the host or anything outside; this needs Docker 28 or newer. Published ports, image pulls and
+  image builds are refused, so images (including `type: image` volume sources) must already
+  exist locally. A project or container started earlier with the network on is refused until
+  you remove it.
 
 ## What the bubblewrap sandbox does
 
@@ -114,7 +124,8 @@ If bubblewrap cannot run (not Linux, `bwrap` missing, user namespaces blocked), 
 The docker group is off unless you enable it (`--enable docker`). The docker daemon runs as
 root, so access to it is root-equivalent on the host. The docker tools run the host `docker`
 CLI outside bubblewrap. They refuse privileged mode, host namespaces, extra capabilities,
-devices, bind mounts outside the workspace and the docker socket, and only touch containers
+devices, bind mounts outside the workspace and the docker socket, volume `driver_opts` types
+other than `none`, `bind` and `tmpfs` (such as NFS or CIFS shares), and only touch containers
 labelled with this workspace. compose runs the resolved config that passed the check, with `.env`,
 `include` and `extends` already applied, so changing those files after the check has no effect.
 The daemon still follows symlinks in bind mount paths when it starts a container. Treat those
@@ -145,20 +156,26 @@ file in the workspace except `.git` internals.
 
 What is redacted:
 
-- the server token, wherever it appears in arguments, results and errors, and in process logs
-  shown on the dashboard;
+- the server token, wherever it appears in arguments, results and errors, and in background
+  process output before it is written to disk;
 - string values of argument keys whose name contains `secret`, `token`, `password`, `passwd`,
   `api_key`, `authorization`, `cookie` or `credential`.
 
 Everything else is stored as is: a password inside a shell command, file contents the agent
-read, command output, the values of `sandbox.env` when a command prints them. Process log
-files on disk are not redacted. Anyone who can read the state dir or open the dashboard can see them.
+read, command output, the values of `sandbox.env` when a command prints them. Anyone who can
+read the state dir or open the dashboard can see them.
 
 Events and process logs older than `audit.retention_days` (default 30) are deleted when the
-server starts. A server that runs for weeks keeps everything until its next start. `null` keeps
-everything forever. The state dir is created with mode 0700. If you point `state_dir` at a
-folder the sandbox can see (for example under `/opt` or `/srv`), the agent can read the audit
-log and the token; keep it under your home.
+server starts and once a day while it runs. The log of a process the server still lists is
+kept until it is no longer listed. `null` keeps everything forever.
+
+The state dir is created with mode 0700. The server refuses to start, and `dev-link doctor`
+fails, when the sandbox would mount it: a `state_dir` under `/usr`, `/etc`, `/opt`, `/srv`, a
+`ro_paths` or `rw_paths` entry or the workspace, or one of those entries inside the state dir.
+It also refuses a `ro_paths` or `rw_paths` entry inside a folder the agent can write (the
+workspace, another `rw_paths` entry, or the sandbox's private home or `/tmp`), because a command
+could replace that entry with a symlink to any host path. Each entry is checked again before
+every command, and one that now resolves into the state dir is skipped with a warning.
 
 ## Config inside the workspace is never read
 

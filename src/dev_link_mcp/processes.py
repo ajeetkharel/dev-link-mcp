@@ -6,6 +6,7 @@ import asyncio
 import codecs
 import contextlib
 import logging
+import os
 import re
 import signal
 import socket
@@ -17,7 +18,7 @@ from typing import Any
 from mcp.server.mcpserver.exceptions import ToolError
 
 from dev_link_mcp import patterns
-from dev_link_mcp.audit import AuditStore
+from dev_link_mcp.audit import AuditStore, StreamRedactor
 from dev_link_mcp.sandbox import Sandbox, kill_group_rest, kill_tree
 
 log = logging.getLogger(__name__)
@@ -27,6 +28,13 @@ LOG_DIR = "processes"
 # How long stop() waits for a process to exit after SIGKILL. One stuck in the kernel (D state)
 # ignores even SIGKILL and must not hold up the server's shutdown.
 REAP_TIMEOUT_S = 5.0
+# How long an exited process's output may take to reach its log. Once its group and scope are
+# killed the pipe closes at once, unless a job that escaped both still holds it.
+PUMP_DRAIN_S = 1.0
+# How long output that could be the start of the token is held back when no more output follows.
+# A prompt such as "Enter value: " followed by a few such characters must still reach readers;
+# a token only leaks if the process pauses this long in the middle of writing it.
+PUMP_HOLD_S = 0.2
 # Input a process has not read yet stays in server memory; past this, more input is refused.
 MAX_UNREAD_INPUT = 1024 * 1024
 # Least time one pattern search gets near the end of a wait, so a normal pattern is not
@@ -38,6 +46,92 @@ class ProcessExited(ToolError):
     """A process exited nonzero while a caller was waiting for its output or port."""
 
 
+class LogPump:
+    """Copies a background process's stdout and stderr into its log file, with secrets redacted.
+
+    The process writes to a pipe whose other end this class reads, so the server token never
+    reaches the disk even when the process prints it. The pipe is made here rather than with
+    stdout=PIPE because asyncio's Process.wait() then also waits for the pipe to close, which a
+    background job (`cmd &`) that outlives bash would hold up until it exits.
+
+    Output that could be the start of the token is held back until more arrives, but for at
+    most PUMP_HOLD_S.
+    """
+
+    def __init__(self, log_path: Path, redactor: StreamRedactor):
+        """Create (or append to) `log_path` and the pipe. Raises OSError if either fails."""
+        self._file = log_path.open("ab", buffering=0)
+        try:
+            read_fd, write_fd = os.pipe()
+        except OSError:
+            self._file.close()
+            raise
+        self._read = open(read_fd, "rb", buffering=0)  # noqa: SIM115 - the pump owns it until close()
+        # Give this to the process as stdout; start() closes the server's copy.
+        self.process_end = open(write_fd, "wb", buffering=0)  # noqa: SIM115
+        self._redactor = redactor
+        self._transport: asyncio.ReadTransport | None = None
+        self._task: asyncio.Task[None] | None = None
+        self._write_failed = False
+
+    async def start(self) -> None:
+        """Start copying. Call once the process holds its end of the pipe."""
+        self.process_end.close()
+        reader = asyncio.StreamReader()
+        loop = asyncio.get_running_loop()
+        self._transport, _ = await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), self._read)
+        self._task = asyncio.create_task(self._copy(reader))
+
+    async def _copy(self, reader: asyncio.StreamReader) -> None:
+        while True:
+            try:
+                # No timer while nothing is held, so an idle process costs no wakeups.
+                async with asyncio.timeout(PUMP_HOLD_S if self._redactor.holding else None):
+                    chunk = await reader.read(1 << 16)
+            except TimeoutError:
+                self._write(self._redactor.flush())
+                continue
+            if not chunk:
+                break
+            self._write(self._redactor.feed(chunk))
+        self._write(self._redactor.flush())
+
+    def _write(self, data: bytes) -> None:
+        if not data or self._write_failed:
+            return
+        try:
+            self._file.write(data)
+        except OSError as exc:
+            # The pipe is still read to the end, so a process on a full disk loses its log
+            # rather than blocking on a full pipe.
+            self._write_failed = True
+            log.warning("cannot write process log %s, dropping further output: %s", self._file.name, exc)
+
+    async def close(self, drain_s: float) -> None:
+        """Let the copy run to the end of the output for up to `drain_s` seconds, then stop it
+        and close the pipe and the log file. Safe to call more than once and before start().
+
+        A job that left the process group can keep the pipe open; it gets EPIPE once the pipe
+        is closed here.
+        """
+        try:
+            if self._task is not None:
+                await asyncio.wait([self._task], timeout=drain_s)
+                if not self._task.done():
+                    self._task.cancel()
+                    await asyncio.wait([self._task])
+                if not self._task.cancelled() and (exc := self._task.exception()) is not None:
+                    log.error("copying process output to %s failed", self._file.name, exc_info=exc)
+        finally:
+            if self._task is not None:
+                self._task.cancel()  # a no-op once done; stops the copy if this call was cancelled
+            if self._transport is not None:
+                self._transport.close()
+            self._read.close()
+            self.process_end.close()
+            self._file.close()
+
+
 @dataclass
 class ManagedProcess:
     id: str
@@ -46,6 +140,7 @@ class ManagedProcess:
     cwd: str
     log_path: Path
     proc: asyncio.subprocess.Process
+    pump: LogPump
     event_id: int
     started: float = field(default_factory=time.time)
     ended: float | None = None
@@ -76,7 +171,7 @@ class ProcessManager:
     """Owns every background process; all of them are killed when the server stops."""
 
     # Exited processes kept for list_processes and process_output; older ones are forgotten
-    # (their log files stay on disk until the startup cleanup).
+    # (their log files stay on disk until the retention prune removes them).
     keep_exited = 50
 
     def __init__(self, sandbox: Sandbox, audit: AuditStore, state_dir: Path, max_processes: int):
@@ -109,14 +204,20 @@ class ProcessManager:
         log_path = self.log_dir / f"{pid_name}-{int(time.time())}.log"
         self._starting += 1
         try:
-            with log_path.open("ab") as log_file:
-                proc = await self.sandbox.spawn(self.sandbox.shell_argv(command), cwd=cwd, log_file=log_file, env=env)
+            pump = LogPump(log_path, self.audit.stream_redactor())
+            try:
+                argv = self.sandbox.shell_argv(command)
+                proc = await self.sandbox.spawn(argv, cwd=cwd, log_file=pump.process_end, env=env)
+            except BaseException:
+                await pump.close(0)
+                raise
         except BaseException:
             log_path.unlink(missing_ok=True)
             raise
         finally:
             self._starting -= 1
         try:
+            await pump.start()
             event_id = self.audit.start(
                 "process", name or pid_name, {"id": pid_name, "command": command, "cwd": str(cwd)}, session=session
             )
@@ -127,6 +228,7 @@ class ProcessManager:
                 cwd=str(cwd),
                 log_path=log_path,
                 proc=proc,
+                pump=pump,
                 event_id=event_id,
             )
             managed.watcher = asyncio.create_task(self._watch(managed))
@@ -135,6 +237,7 @@ class ProcessManager:
             # full disk). The unreaped leader keeps its pid, so reap() cannot hit a reused one.
             kill_tree(proc.pid)
             self.sandbox.reap(proc.pid)
+            await pump.close(0)
             raise
         self._procs[pid_name] = managed
         self._notify(managed, "started")
@@ -146,6 +249,8 @@ class ProcessManager:
         # Without a PID namespace, `cmd &` jobs and setsid children outlive bash; end them with
         # it, as bubblewrap does, since nothing else tracks them.
         self.sandbox.reap(managed.proc.pid)
+        # Before the exit is visible, so whoever sees it also finds all of the output in the log.
+        await managed.pump.close(PUMP_DRAIN_S)
         managed.exit_code = code
         managed.ended = time.time()
         tail, _ = self.read_log(managed.id, tail_lines=40)
@@ -171,9 +276,9 @@ class ProcessManager:
     def watch_logs(self) -> None:
         """Publish "log" messages while a dashboard stream is open and a process is running.
 
-        Process output goes straight from the child to its log file, so growth is only seen by
-        checking file sizes: twice a second, and only while both conditions hold. Each message
-        is {"id", "offset"}, where offset is the new log size in bytes. Safe to call often.
+        Growth is seen by checking log file sizes twice a second, and only while both conditions
+        hold, so a chatty process sends at most two messages a second. Each message is
+        {"id", "offset"}, where offset is the new log size in bytes. Safe to call often.
         """
         idle = self._log_watch is None or self._log_watch.done()
         if idle and self.audit.live.active and any(p.running for p in self._procs.values()):
@@ -204,6 +309,10 @@ class ProcessManager:
 
     def list(self) -> list[dict[str, Any]]:
         return [p.summary() for p in self._procs.values()]
+
+    def log_paths(self) -> set[Path]:
+        """Log files of every process list() shows, running or exited; nothing is read from disk."""
+        return {p.log_path for p in self._procs.values()}
 
     def read_log(
         self, process_id: str, *, offset: int = 0, max_bytes: int = 100_000, tail_lines: int | None = None
@@ -283,7 +392,9 @@ class ProcessManager:
             # signal yet, so it can outlive its bwrap; it is still in this group.
             kill_group_rest(managed.proc.pid)
         if managed.watcher:
-            await managed.watcher
+            # Shielded: a cancelled stop must not cancel the watcher, or the exit would never be
+            # recorded and the process would stay listed as running.
+            await asyncio.shield(managed.watcher)
         return managed.exit_code
 
     async def wait_for(

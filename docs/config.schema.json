@@ -21,7 +21,7 @@
             }
           ],
           "default": 30,
-          "description": "Audit events and background process logs older than this many days are deleted when the server starts. `null` keeps everything.",
+          "description": "Audit events and background process logs older than this many days are deleted when the server starts and once a day while it runs. Logs of processes the server still lists are kept. `null` keeps everything.",
           "title": "Retention Days"
         }
       },
@@ -114,7 +114,7 @@
           "type": "boolean"
         },
         "ro_paths": {
-          "description": "Host paths mounted read-only inside the sandbox in addition to the system folders. Missing paths are skipped, so one config works across machines.",
+          "description": "Host paths mounted read-only inside the sandbox in addition to the system folders. Missing paths are skipped, so one config works across machines. None may lie inside the workspace or a `rw_paths` entry, where the agent could swap it for a symlink.",
           "items": {
             "type": "string"
           },
@@ -134,7 +134,7 @@
           ]
         },
         "rw_paths": {
-          "description": "Host paths mounted read-write. Anything here is reachable by the agent.",
+          "description": "Host paths mounted read-write. Anything here is reachable by the agent. None may lie inside the workspace or another entry.",
           "items": {
             "type": "string"
           },
@@ -376,7 +376,7 @@
         }
       ],
       "default": null,
-      "description": "Where logs, the audit store and the sandbox home live. Must be outside the workspace. Default: `$XDG_STATE_HOME/dev-link-mcp/<folder name>-<hash>`.",
+      "description": "Where logs, the audit store and the sandbox home live. Must be outside the workspace and, with a sandbox, outside every folder it mounts (system folders, `sandbox.ro_paths`, `sandbox.rw_paths`) with none of them inside it. Default: `$XDG_STATE_HOME/dev-link-mcp/<folder name>-<hash>`.",
       "title": "State Dir"
     },
     "log_level": {

@@ -13,14 +13,6 @@ DESTRUCTIVE = types.ToolAnnotations(read_only_hint=False, destructive_hint=True,
 OPEN_WORLD_READ = types.ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=True)
 OPEN_WORLD = types.ToolAnnotations(read_only_hint=False, destructive_hint=True, open_world_hint=True)
 
-# Appended to refused loopback connections when the network is off. Each sandboxed command then
-# gets its own network namespace, so the usual cause is a server the agent started itself.
-NETWORK_OFF_REFUSED_HINT = (
-    "The network is off, so every sandboxed command runs in its own network namespace: a server started"
-    " with start_process or run_command cannot be reached from here. Test it from inside the same command,"
-    " or ask the user to restart the server with network access."
-)
-
 
 def clip(text: str, limit: int) -> str:
     """Keep the head and tail of `text` within `limit` characters, marking the cut."""
