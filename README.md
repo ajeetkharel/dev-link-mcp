@@ -177,7 +177,7 @@ dev-link install-browser                       # Chromium for the browser tools
   user namespaces bubblewrap needs; see the [AppArmor note](https://github.com/ajeetkharel/dev-link-mcp/blob/main/CONTRIBUTING.md#setup).
 - **git and ripgrep**: used by the tools (`sudo apt install git ripgrep`).
 - **cloudflared**: only for `--tunnel`. See [Install cloudflared](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/clients/web.md#install-cloudflared).
-- **macOS**: runs only with `--no-sandbox`. With `--tunnel` as well, anyone with the public URL gets
+- **macOS** (experimental): runs only with `--no-sandbox`. With `--tunnel` as well, anyone with the public URL gets
   your full user access.
 
 `dev-link doctor` checks each of these and says how to fix what is missing.
@@ -223,7 +223,7 @@ report vulnerabilities as described in
 | Platform | Support |
 | --- | --- |
 | Linux | Supported. Commands run in a bubblewrap sandbox. |
-| macOS | Only with `--no-sandbox`, which gives the agent your full user access. |
+| macOS | Experimental. Only with `--no-sandbox`, which gives the agent your full user access. Not tested in CI yet, and `wait_for_process` may not see a dev server's port. |
 | Windows | Not supported. |
 
 ## Documentation

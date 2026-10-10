@@ -35,6 +35,7 @@ First public release.
 - Tool group plugins through the `dev_link_mcp.tool_groups` entry point, loaded only when
   `tools.enabled` names them. The plugin API and config format are provisional.
 - `mcp` is pinned below 3, because the tool schema trim relies on SDK internals.
+- macOS is experimental: it runs only with `--no-sandbox` and is not tested in CI yet.
 
 ### Security
 

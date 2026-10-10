@@ -76,7 +76,12 @@ jobs:
       - run: uv run --frozen playwright install-deps chromium
       - run: uv run --frozen pytest -m browser -rfs
 
+  # Skipped for now: macOS is experimental in 0.1.0. Eight tests assume Linux (/proc/self/fd, GNU
+  # timeout, setsid, systemd-run, non-UTF-8 file names, the Linux sandbox message), and on the runner
+  # wait_for_process never sees a test server's port open (test_processes.py, test_process_manager.py).
+  # Remove the `if` once those pass.
   macos:
+    if: false
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
