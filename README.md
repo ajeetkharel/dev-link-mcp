@@ -17,7 +17,7 @@
   <a href="https://github.com/ajeetkharel/dev-link-mcp/actions/workflows/ci.yml"><img src="https://github.com/ajeetkharel/dev-link-mcp/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
 </p>
 
-![The dev-link dashboard during an agent session](https://raw.githubusercontent.com/ajeetkharel/dev-link-mcp/main/docs/assets/dashboard.png)
+![The dev-link dashboard during an agent session: activity feed, background processes, workspace files, tasks and notes](https://raw.githubusercontent.com/ajeetkharel/dev-link-mcp/main/docs/assets/dashboard.gif)
 
 **What.** dev-link is an MCP server that runs on your machine and exposes one project folder:
 files, search, a shell, background processes, a headless browser and checkpoints.
