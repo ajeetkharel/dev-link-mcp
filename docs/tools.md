@@ -316,7 +316,8 @@ Returns text only.
 ### `run_command`
 
 Run a shell command and wait for it to finish. Returns the exit code, duration, stdout
-and stderr; a non-zero exit is reported in the text, not as a tool error. Use start_process
+and stderr; a non-zero exit is reported in the text, not as a tool error. This is the
+fallback: when another offered tool does the job, use that tool instead. Use start_process
 for servers, watchers and anything long-running: background jobs (`cmd &`, nohup) are
 killed when the command returns. Sandboxed commands share a /tmp (emptied when
 the server starts) and a private HOME, both kept between calls.

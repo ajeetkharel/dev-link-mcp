@@ -19,8 +19,11 @@
 
 ![The dev-link dashboard during an agent session: activity feed, background processes, workspace files, tasks and notes](https://raw.githubusercontent.com/ajeetkharel/dev-link-mcp/main/docs/assets/dashboard.gif)
 
-**What.** dev-link is an MCP server that runs on your machine and exposes one project folder:
-files, search, a shell, background processes, a headless browser and checkpoints.
+**What.** dev-link is an MCP server that runs on your machine and gives your AI a complete
+development environment for one project folder: 78 tools that read and edit files, search code,
+run commands, keep dev servers running, build, lint and test, navigate code, call HTTP APIs, query
+SQLite, JSON and CSV, take checkpoints, keep a task list and drive a headless browser, plus
+Docker when you turn it on. [Tools](#tools) lists every one.
 
 **Why.** Web chats such as ChatGPT and Grok can add a custom MCP server, and so can every coding
 agent and editor, including Claude Code, Codex CLI, Cursor and VS Code. dev-link gives any of them
@@ -184,23 +187,24 @@ dev-link install-browser                       # Chromium for the browser tools
 
 ## Tools
 
-Tools come in groups. All groups are on by default except docker.
+78 tools in 13 groups. Every group is on by default except docker (`--enable docker`). The code
+and browser groups need the `[code]` and `[browser]` extras; `[all]` installs both.
 
-| Group | For | Default | Extra |
-| --- | --- | --- | --- |
-| `system` | workspace and server info | on | |
-| `files` | read, write, edit, move and delete files | on | |
-| `search` | find files, grep, search and replace (ripgrep) | on | |
-| `shell` | run commands and code snippets | on | |
-| `processes` | dev servers and watchers in the background | on | |
-| `code` | outlines, definitions and references (tree-sitter) | on | `code` |
-| `project` | detect the stack; install, build, lint, format, test | on | |
-| `http` | HTTP requests, fetch pages, downloads | on | |
-| `data` | SQLite, jq and CSV | on | |
-| `checkpoints` | snapshot, diff and restore the workspace | on | |
-| `tasks` | a persistent task list and notes | on | |
-| `browser` | a headless Chromium (Playwright) | on | `browser` |
-| `docker` | containers and compose, limited to the workspace | opt-in (`--enable docker`) | |
+| Group | For | Tools |
+| --- | --- | --- |
+| `system` | workspace and server info | `server_status`, `workspace_info` |
+| `files` | read, write, edit, move and delete files | `read_file`, `read_many_files`, `write_file`, `edit_file`, `multi_edit`, `apply_patch`, `list_dir`, `tree`, `file_info`, `make_dir`, `copy_path`, `move_path`, `delete_path` |
+| `search` | find files, grep, search and replace (ripgrep) | `find_files`, `grep`, `replace_in_files` |
+| `shell` | run commands and code snippets | `run_command`, `run_code` |
+| `processes` | dev servers and watchers in the background | `start_process`, `list_processes`, `process_output`, `process_input`, `wait_for_process`, `stop_process` |
+| `code` | outlines, definitions and references (tree-sitter) | `code_outline`, `code_stats`, `find_symbol`, `find_references` |
+| `project` | detect the stack; install, build, lint, format, test | `project_detect`, `install_deps`, `run_build`, `run_lint`, `run_format`, `run_tests` |
+| `http` | HTTP requests, fetch pages, downloads | `http_request`, `fetch_url`, `download_file` |
+| `data` | SQLite, jq and CSV | `sqlite_query`, `sqlite_schema`, `json_query`, `csv_preview` |
+| `checkpoints` | snapshot, diff and restore the workspace | `checkpoint_create`, `checkpoint_list`, `checkpoint_diff`, `checkpoint_restore` |
+| `tasks` | a persistent task list and notes | `task_add`, `task_list`, `task_update`, `note_write`, `note_read`, `note_list`, `note_delete` |
+| `browser` | a headless Chromium (Playwright) | `browser_open`, `browser_navigate`, `browser_snapshot`, `browser_screenshot`, `browser_click`, `browser_type`, `browser_press`, `browser_select`, `browser_wait`, `browser_eval`, `browser_console`, `browser_network`, `browser_set_viewport`, `browser_list_pages`, `browser_close` |
+| `docker` | containers and compose, limited to the workspace | `docker_run`, `docker_exec`, `docker_ps`, `docker_logs`, `docker_stop`, `docker_rm`, `docker_build`, `docker_images`, `compose` |
 
 A group whose extra is missing is reported as not installed. Git, package managers and any
 other CLI run through `run_command`, as in your own terminal. Every tool and its parameters are

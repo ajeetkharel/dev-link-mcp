@@ -34,14 +34,18 @@ from dev_link_mcp.web import add_dashboard_routes
 log = logging.getLogger(__name__)
 
 INSTRUCTIONS = """\
-dev-link-mcp is a development environment for one workspace folder. Work as you would in
-your own terminal: you may run any command and change anything in the workspace.
+dev-link-mcp is a development environment for one workspace folder. You may run any command
+and change anything in the workspace.
 
 - Call workspace_info first: it shows the sandbox mode, network access, limits and
   installed toolchains.
-- run_command runs any shell command (cat, sed, rg, python, npm, git, ...); use it for git
-  too. The file and search tools are shortcuts with numbered reads, exact-match edits,
-  patches, images and compact results. Use whichever fits.
+- Prefer the dedicated tools. Before reaching for the shell, check whether one of the
+  offered tools already does the job, and use it if so. The dedicated tools return
+  structured, compact results, check their input, and show up as clear, separate steps on
+  the user's dashboard. A shell command that does the same thing hides that detail.
+- Use run_command as the fallback, for work that no offered tool covers. The set of tools
+  depends on the server's configuration, so a tool you expect may be missing; in that case
+  the shell is the right choice.
 - Use start_process for servers, watchers and anything long-running, and process_output to
   read their output. The browser_* tools load pages in Chromium and save screenshots under
   .dev-link/artifacts.
