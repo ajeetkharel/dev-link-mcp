@@ -1,13 +1,13 @@
 [project]
 name = "dev-link-mcp"
 version = "0.1.0"
-description = "Sandboxed, fully logged development MCP server that exposes one folder to a coding agent"
+description = "Sandboxed, fully logged development environment for one folder that any MCP client, from coding agents to web chats, can use"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Amit Kharel" }]
-keywords = ["mcp", "model-context-protocol", "coding-agent", "sandbox", "bubblewrap", "developer-tools"]
+keywords = ["mcp", "model-context-protocol", "chatgpt", "coding-agent", "sandbox", "bubblewrap", "developer-tools"]
 # PEP 639: with an SPDX `license` expression, a License :: classifier is not allowed.
 classifiers = [
     "Development Status :: 3 - Alpha",

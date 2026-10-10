@@ -1,7 +1,7 @@
-# Connecting clients
+# Local clients
 
-dev-link speaks MCP over Streamable HTTP only; there is no stdio mode. Start a server and print
-its URL:
+These clients run on the same machine as dev-link and connect to it on `127.0.0.1`: Claude Code,
+Codex CLI, Cursor and VS Code. Start a server and print its URL:
 
 ```bash
 dev-link start DIR
@@ -9,7 +9,7 @@ dev-link url DIR        # http://127.0.0.1:8765/mcp/<token>
 ```
 
 Every client below takes that URL as a remote HTTP server. The token in the path is the
-password: anyone with the URL can run commands in DIR (see [security.md](security.md)).
+password: anyone with the URL can run commands in DIR (see [security.md](../security.md)).
 
 ## The URL changes on restart
 
@@ -164,31 +164,5 @@ With `bearer` auth, let VS Code prompt for the token instead of storing it:
 Check it with **MCP: List Servers**, the server's **Show Output** log, or the tools picker in
 chat.
 
-## ChatGPT
-
-ChatGPT connects only to MCP servers it can reach from the internet over HTTPS, so publish the
-server through a tunnel:
-
-```bash
-dev-link start DIR --tunnel     # needs cloudflared
-dev-link url DIR                # https://<random>.trycloudflare.com/mcp/<token>
-```
-
-In ChatGPT on the web, open Plugins, choose the plus button, then **Add custom MCP server**.
-Enter a name, paste the URL from `dev-link url` as the server URL, and choose **No
-authentication**: the token in the path is the secret. ChatGPT offers OAuth or no
-authentication, not a fixed header, so `bearer` auth does not work here.
-
-Both the tunnel hostname and the token change on every start, so the server has to be added
-again after each restart. A fixed hostname needs your own tunnel or proxy: start with
-`--public-url https://your.host` and a pinned token.
-
-Anyone with the public URL can run commands on your machine. Stop the server
-(`dev-link stop DIR`) when you are done.
-
-Which ChatGPT plans can add custom MCP servers, and whether tools that write are allowed on
-each, has changed several times. Workspace admins can also turn the feature off. Check OpenAI's
-help article "Developer mode and MCP apps in ChatGPT" for your plan.
-
 The client settings on this page were checked against each client's documentation on
-2026-10-09. Clients change often; if a step no longer matches, their docs win.
+2026-10-10. Clients change often; if a step no longer matches, their docs win.
