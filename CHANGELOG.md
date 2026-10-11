@@ -22,6 +22,11 @@ format may change between minor releases; every such change is listed here.
 
 - The commands that `dev-link start` suggests leave out the folder when you are already in it.
 
+### Fixed
+
+- `dev-link start`, `dev-link status` and the `serve` banner line up their labels when they show
+  public URLs.
+
 ## [0.1.0]
 
 First public release.

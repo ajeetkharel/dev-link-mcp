@@ -179,6 +179,15 @@ def test_banner_without_auth_has_nothing_to_hide(tmp_path, workspace):
     assert "  workspace : " in shown and "  sandbox   : bubblewrap\n" in shown
 
 
+def test_banner_lines_up_the_public_urls(tmp_path, workspace):
+    cfg = Config(workspace=workspace, state_dir=tmp_path / "state", server={"public_url": "https://pub.example"})
+    shown = _banner(cfg.finalize(), "bubblewrap", 12, tmp_path / "connection.json", show_token=False)
+    labels = ("workspace", "MCP URL", "dashboard", "public MCP URL", "public dashboard", "token", "logs")
+    fields = [line for line in shown.splitlines() if line.strip().partition(":")[0].strip() in labels]
+    assert len(fields) == len(labels), shown
+    assert len({line.index(":") for line in fields}) == 1, shown
+
+
 @pytest.fixture(autouse=True)
 def _only_system_tools(monkeypatch):
     monkeypatch.setattr(tools, "BUILTINS", tuple(b for b in tools.BUILTINS if b.name == "system"))

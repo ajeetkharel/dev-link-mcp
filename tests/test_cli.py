@@ -221,9 +221,11 @@ def test_start_status_url_logs_stop(tmp_path, cli_env):
     assert f"dev-link started for {ws_a}" in started.stdout
     assert "dev-link stop" in started.stdout
     token = "cli-token-not-in-argv-0123"
-    other = run(cli_env, "start", str(ws_b), "--token", token, *sandbox_flags())
+    public = ("--public-url", "https://pub.example")
+    other = run(cli_env, "start", str(ws_b), "--token", token, *public, *sandbox_flags())
     try:
         assert other.returncode == 0, other.stderr
+        assert "public MCP URL" in other.stdout and len(_colons(other.stdout)) == 1, other.stdout
         # Captured output is not a terminal, so the token stays out of it.
         assert token not in other.stdout
         assert "/mcp/***" in other.stdout and f"dev-link url {ws_b}" in other.stdout
@@ -248,6 +250,9 @@ def test_start_status_url_logs_stop(tmp_path, cli_env):
         assert conn_b["mcp_url"].endswith(f"/mcp/{token}")
         args_b = subprocess.run(["ps", "-ww", "-o", "args=", "-p", str(conn_b["pid"])], capture_output=True, text=True)
         assert "dev_link_mcp serve" in args_b.stdout and token not in args_b.stdout
+
+        status_b = run(cli_env, "status", str(ws_b))
+        assert "public dash" in status_b.stdout and len(_colons(status_b.stdout)) == 1, status_b.stdout
 
         everything = run(cli_env, "status", "--all")
         assert everything.returncode == 0
@@ -277,6 +282,16 @@ def test_start_status_url_logs_stop(tmp_path, cli_env):
     finally:
         run(cli_env, "stop", str(ws_a))
         run(cli_env, "stop", str(ws_b))
+
+
+FIELD_LABELS = ("MCP URL", "dashboard", "public MCP URL", "public MCP", "public dash", "PID", "logs", "running")
+
+
+def _colons(text: str) -> set[int]:
+    """The columns where the `label: value` lines of start or status output put their colon."""
+    fields = [line for line in text.splitlines() if line.strip().partition(":")[0].strip() in FIELD_LABELS]
+    assert len(fields) >= 4, text
+    return {line.index(":") for line in fields}
 
 
 # --- tunnel ----------------------------------------------------------------------------------

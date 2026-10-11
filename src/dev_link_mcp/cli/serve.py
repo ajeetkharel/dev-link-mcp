@@ -258,18 +258,19 @@ def cmd_start(args: argparse.Namespace) -> int:
             if info is not None and info.get("pid") == proc.pid:
                 break
         time.sleep(0.2)
-    lines = [f"dev-link started for {config.workspace}", "", f"  MCP URL   : {info.get('mcp_url', '?')}"]
-    lines.append(f"  dashboard : {info.get('dashboard_url', '?')}")
+    fields: list[tuple[str, object]] = [
+        ("MCP URL", info.get("mcp_url", "?")),
+        ("dashboard", info.get("dashboard_url", "?")),
+    ]
     for label, key in (("public MCP URL", "public_mcp_url"), ("public dash", "public_dashboard_url")):
         if key in info:
-            lines.append(f"  {label:<10}: {info[key]}")
-    for name, value in (info.get("headers") or {}).items():
-        lines.append(f"  header    : {name}: {value}")
-    lines += [
-        f"  PID       : {proc.pid}",
-        f"  logs      : {log_path}",
-        "",
-    ]
+            fields.append((label, info[key]))
+    fields += [("header", f"{name}: {value}") for name, value in (info.get("headers") or {}).items()]
+    fields += [("PID", proc.pid), ("logs", log_path)]
+    width = max(len(label) for label, _ in fields) + 1
+    lines = [f"dev-link started for {config.workspace}", ""]
+    lines += [f"  {label:<{width}}: {value}" for label, value in fields]
+    lines.append("")
     if keeps_token:
         lines.append(
             "The public MCP URL stays the same across restarts; anyone with it can use the server."
@@ -337,7 +338,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"stopped   : {config.workspace}")
         return STATUS_STOPPED
     info = instance.read_connection(config.state_dir) or {}
-    lines = [f"running   : PID {pid}", f"workspace : {config.workspace}"]
+    fields: list[tuple[str, object]] = [("running", f"PID {pid}"), ("workspace", config.workspace)]
     for label, key in (
         ("MCP URL", "mcp_url"),
         ("dashboard", "dashboard_url"),
@@ -345,9 +346,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         ("public dash", "public_dashboard_url"),
     ):
         if key in info:
-            lines.append(f"{label:<10}: {info[key]}")
-    lines.append(f"state dir : {config.state_dir}")
-    print("\n".join(lines))
+            fields.append((label, info[key]))
+    fields.append(("state dir", config.state_dir))
+    width = max(len(label) for label, _ in fields) + 1
+    print("\n".join(f"{label:<{width}}: {value}" for label, value in fields))
     return 0
 
 

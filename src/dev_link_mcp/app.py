@@ -171,27 +171,25 @@ def _banner(config: Config, sandbox: str, groups_tools: int, conn_file: Path, *,
     if config.server.auth == "bearer":
         add += f' --header "Authorization: Bearer {config.server.token}"'
     hide = not show_token and bool(config.server.token)
-    hidden = [f"  token     : hidden because this output is not a terminal; see {conn_file}"] if hide else []
+    fields: list[tuple[str, object]] = [
+        ("workspace", config.workspace),
+        ("tools", groups_tools),
+        ("auth", config.server.auth),
+        ("sandbox", sandbox),
+        ("MCP URL", info["mcp_url"]),
+        ("dashboard", info["dashboard_url"]),
+    ]
+    if config.server.public_url:
+        fields += [("public MCP URL", info["public_mcp_url"]), ("public dashboard", info["public_dashboard_url"])]
+    if hide:
+        fields.append(("token", f"hidden because this output is not a terminal; see {conn_file}"))
+    fields.append(("logs", config.state_dir))
+    width = max(len(label) for label, _ in fields) + 1
     text = "\n".join(
         [
             "",
             "  dev-link-mcp ready",
-            f"  workspace : {config.workspace}",
-            f"  tools     : {groups_tools}",
-            f"  auth      : {config.server.auth}",
-            f"  sandbox   : {sandbox}",
-            f"  MCP URL   : {info['mcp_url']}",
-            f"  dashboard : {info['dashboard_url']}",
-            *(
-                [
-                    f"  public MCP URL   : {info['public_mcp_url']}",
-                    f"  public dashboard : {info['public_dashboard_url']}",
-                ]
-                if config.server.public_url
-                else []
-            ),
-            *hidden,
-            f"  logs      : {config.state_dir}",
+            *(f"  {label:<{width}}: {value}" for label, value in fields),
             *(
                 ["", "  WARNING: anyone with the public URL can run commands in this workspace."]
                 if config.server.public_url
