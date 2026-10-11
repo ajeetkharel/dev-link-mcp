@@ -175,7 +175,7 @@ Descriptions and parameters are exactly what the server publishes.
 
 Turn a group off with `tools.disabled` (or `--disable GROUP`), turn on an opt-in group with
 `tools.enabled` (or `--enable GROUP`), and remove single tools with `tools.disabled_tools`; see
-[configuration.md](configuration.md#tool-groups). `dev-link tools DIR` lists the tools a given
+[configuration.md](configuration.md#tool-groups). `dev-link tools` lists the tools a given
 configuration publishes.
 """
 

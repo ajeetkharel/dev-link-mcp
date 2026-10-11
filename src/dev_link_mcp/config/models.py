@@ -11,6 +11,7 @@ import re
 import secrets
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, Strict, field_validator, model_validator
 
@@ -84,6 +85,30 @@ class ServerConfig(Section):
                 " which puts a fresh secret token in the URL path on every start"
             )
         return self
+
+
+class TunnelConfig(Section):
+    ngrok_url: str = Field(
+        default="",
+        description="Your ngrok domain, e.g. `https://name.ngrok-free.app`. With `--tunnel` the server is "
+        "published there through ngrok instead of a Cloudflare quick tunnel, and the token is kept in the state "
+        "directory, so the public URL stays the same across restarts. Empty means a quick tunnel.",
+    )
+
+    @field_validator("ngrok_url")
+    @classmethod
+    def _check_ngrok_url(cls, value: str) -> str:
+        value = value.strip().removesuffix("/")
+        if not value:
+            return value
+        parts = urlsplit(value)
+        # urlsplit drops an empty `?` or `#`, so look for them in the text itself.
+        if parts.scheme != "https" or not parts.hostname or parts.path or "?" in value or "#" in value:
+            raise ValueError("ngrok_url must be https://<host> with no path, e.g. https://name.ngrok-free.app")
+        if parts.username or parts.password or parts.port:
+            raise ValueError("ngrok_url must not contain a user, password or port")
+        # The host in lower case, as ngrok reports it and as the server compares it with Host headers.
+        return f"https://{parts.hostname}"
 
 
 class SandboxConfig(Section):
@@ -204,6 +229,7 @@ class Config(Section):
     )
     log_level: LogLevel = Field(default="INFO", description="Server log level. Lower case is accepted.")
     server: ServerConfig = Field(default_factory=ServerConfig, description="Network address and authentication.")
+    tunnel: TunnelConfig = Field(default_factory=TunnelConfig, description="How `--tunnel` publishes the server.")
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig, description="Isolation of agent commands.")
     limits: LimitsConfig = Field(
         default_factory=LimitsConfig, description="Timeouts, size limits and resource caps for tools."

@@ -75,6 +75,17 @@ def server_parser() -> argparse.ArgumentParser:
         help="publish the server through a Cloudflare quick tunnel (needs cloudflared; anyone with the URL"
         " can run commands)",
     )
+    g.add_argument(
+        "--ngrok-url",
+        metavar="URL",
+        help="with --tunnel, publish through ngrok on your fixed domain (https://name.ngrok-free.app) so the"
+        " public URL stays the same across restarts",
+    )
+    g.add_argument(
+        "--new-token",
+        action="store_true",
+        help="with --tunnel and an ngrok URL, replace the kept token; the old public URL stops working",
+    )
     return p
 
 
@@ -96,7 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     add("serve", "run the server in the foreground", with_server=True)
     add("start", "run the server in the background and wait until it answers", with_server=True)
-    add("stop", "stop the server for DIR (SIGTERM, then SIGKILL after 10 s)")
+    add("stop", "stop the server (SIGTERM, then SIGKILL after 10 s)")
     add("restart", "stop, then start with the given options", with_server=True)
     status = add("status", "show whether the server runs (exit 0) or not (exit 3)")
     status.add_argument(
@@ -145,6 +156,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise SystemExit(2)
     if getattr(args, "tunnel", False) and args.public_url:
         parser.error("--tunnel sets the public URL itself; drop --public-url")
+    if getattr(args, "ngrok_url", None) and not args.tunnel:
+        parser.error("--ngrok-url only applies with --tunnel")
     if args.command == "logs" and args.follow and args.target == "all":
         parser.error("logs all cannot follow; pick server, tunnel or audit with -f")
     return args

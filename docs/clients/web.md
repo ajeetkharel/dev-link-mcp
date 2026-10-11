@@ -38,9 +38,12 @@ macOS: `brew install cloudflared`. Other systems: see Cloudflare's
 ## Start a public server
 
 ```bash
-dev-link start DIR --tunnel
-dev-link url DIR                # https://<random>.trycloudflare.com/mcp/<token>
+dev-link start --tunnel
+dev-link url            # https://<random>.trycloudflare.com/mcp/<token>
 ```
+
+This URL changes on every start. [A URL that stays the same](#a-url-that-stays-the-same) shows
+how to keep one with a free ngrok domain.
 
 Paste that URL into the client as the server URL, with no authentication: the token in the path
 is the secret. Neither client documents a field for a fixed header, so `bearer` auth does not
@@ -75,17 +78,69 @@ members can use it. See xAI's [connector docs](https://docs.x.ai/grok/connectors
 
 ## After a restart
 
-The tunnel hostname and the token both change on every start, so the old URL stops working.
-Remove the server from the client and add it again with the new URL from `dev-link url DIR`.
+With a quick tunnel, the hostname and the token both change on every start, so the old URL stops
+working. ChatGPT and Grok cannot edit a server's URL, and uploading a new ChatGPT plugin zip keeps
+the old one, so remove the server from the client and add it again with the new URL from
+`dev-link url`. To avoid that, use a URL that stays the same.
 
-A URL that stays the same needs your own tunnel or reverse proxy with a fixed hostname: start with
+## A URL that stays the same
+
+Every free ngrok account gets one fixed domain, such as `https://name.ngrok-free.app`. With that
+domain set, `--tunnel` publishes through ngrok instead of Cloudflare. dev-link also keeps the token
+in the folder's state directory, so the public URL is the same after every restart and you add
+the server to ChatGPT or Grok once.
+
+1. Sign up at [ngrok.com](https://dashboard.ngrok.com/signup), install ngrok (the
+   [install script](../../scripts/install.sh) offers it; otherwise see
+   [ngrok's downloads](https://ngrok.com/download)), and add your authtoken:
+
+   ```bash
+   ngrok config add-authtoken <your authtoken>
+   ```
+
+2. Copy your domain from [dashboard.ngrok.com/domains](https://dashboard.ngrok.com/domains) and set
+   it once in `~/.config/dev-link/config.yaml` (the install script can write it for you):
+
+   ```yaml
+   tunnel:
+     ngrok_url: https://name.ngrok-free.app
+   ```
+
+   `--ngrok-url https://name.ngrok-free.app` does the same for one start.
+
+3. Start as before. `dev-link url` prints `https://name.ngrok-free.app/mcp/<token>`, and it
+   stays the same across `stop`, `start` and `restart`:
+
+   ```bash
+   dev-link start --tunnel
+   ```
+
+To change the token, for example after the URL leaked, start with `--new-token`. The old URL
+stops working, so add the server to your clients again. A token you set yourself with `--token`,
+`server.token` or `DEV_LINK_SERVER__TOKEN` is used instead of the kept one.
+
+Things to know:
+
+- One free domain can be online from one place at a time. A second server on the same domain fails
+  with ngrok error `ERR_NGROK_334`, shown by `dev-link start`.
+- The free plan has monthly limits on requests and data transfer. See
+  [ngrok's free plan limits](https://ngrok.com/docs/pricing-limits/free-plan-limits/). When a limit
+  is reached, ngrok refuses requests until the next cycle.
+- ngrok shows a warning page to browsers on free domains. It is meant for people, not API
+  clients, but it is in front of the `public dash` URL. Open the dashboard on the local URL
+  instead.
+- TLS ends at ngrok, so ngrok handles the token and all traffic in clear text, as Cloudflare
+  does for quick tunnels.
+
+Any other tunnel or reverse proxy with a fixed hostname works too: start with
 `--public-url https://your.host` and a pinned token (see
 [The URL changes on restart](local.md#the-url-changes-on-restart)).
 
 ## Stopping and troubleshooting
 
-`dev-link stop DIR` stops the server and the tunnel. If cloudflared exits on its own, the server
-stops too, and `dev-link logs server DIR` shows why.
+`dev-link stop` stops the server and the tunnel. If cloudflared or ngrok exits on its own,
+the server stops too, and `dev-link logs server` shows why. `dev-link logs tunnel` shows
+the tunnel program's own log.
 
 Cloudflare gives quick tunnels no uptime guarantee and allows up to 200 requests in flight per
 tunnel. They suit a working session, not a server that stays up.

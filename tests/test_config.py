@@ -8,7 +8,7 @@ from pydantic import ValidationError
 
 from dev_link_mcp.cli.common import config_from_args
 from dev_link_mcp.cli.main import parse_args
-from dev_link_mcp.config import Config, ServerConfig, default_user_file, load_config
+from dev_link_mcp.config import Config, ServerConfig, TunnelConfig, default_user_file, load_config
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -564,3 +564,27 @@ def test_audit_retention_days(tmp_path, workspace):
         path.write_text(f"audit:\n  retention_days: {bad}\n")
         with pytest.raises(ValueError, match=r"audit\.retention_days: Input should be greater than or equal to 1"):
             _load(path, {"workspace": str(workspace), "state_dir": tmp_path / "s"})
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://x.ngrok-free.app",
+        "https://x.ngrok-free.app/mcp",
+        "https://x.ngrok-free.app?a=1",
+        "https://x.ngrok-free.app?",
+        "https://x.ngrok-free.app#",
+        "https://user:pw@x.ngrok-free.app",
+        "https://x.ngrok-free.app:8443",
+        "x.ngrok-free.app",
+    ],
+)
+def test_ngrok_url_must_be_a_bare_https_origin(url):
+    with pytest.raises(ValidationError, match="ngrok_url"):
+        TunnelConfig(ngrok_url=url)
+
+
+def test_ngrok_url_is_normalised():
+    assert TunnelConfig(ngrok_url=" https://x.ngrok-free.app/ ").ngrok_url == "https://x.ngrok-free.app"
+    assert TunnelConfig(ngrok_url="HTTPS://Name.ngrok-free.app").ngrok_url == "https://name.ngrok-free.app"
+    assert TunnelConfig().ngrok_url == ""

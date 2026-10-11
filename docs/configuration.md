@@ -80,6 +80,14 @@ Network address and authentication.
 | `server.public_url` | string | `""` | Public base URL when the server sits behind a tunnel or proxy (e.g. `https://x.trycloudflare.com`). Its hostname is accepted automatically and the banner prints public URLs. Not allowed with auth `none`. |
 | `server.allowed_hosts` | list of strings | `[]` | Extra Host header values to accept, e.g. a tunnel hostname. Exact match, or `host:*` for any port. Not allowed with auth `none`. |
 
+## `tunnel`
+
+How `--tunnel` publishes the server.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `tunnel.ngrok_url` | string | `""` | Your ngrok domain, e.g. `https://name.ngrok-free.app`. With `--tunnel` the server is published there through ngrok instead of a Cloudflare quick tunnel, and the token is kept in the state directory, so the public URL stays the same across restarts. Empty means a quick tunnel. |
+
 ## `sandbox`
 
 Isolation of agent commands.

@@ -7,11 +7,14 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
+import secrets
 import signal
 import subprocess
 import sys
 import time
 import urllib.request
+from pathlib import Path
 from types import FrameType
 from urllib.parse import urlsplit
 
@@ -23,6 +26,9 @@ from dev_link_mcp.config import Config, default_state_root
 from dev_link_mcp.private import open_private
 
 STATUS_STOPPED = 3
+
+# Same rule as a configured token: at least 16 URL-safe characters.
+_KEPT_TOKEN = re.compile(r"[A-Za-z0-9._~-]{16,}")
 
 
 def _terminate(sig: int, frame: FrameType | None) -> None:
@@ -43,17 +49,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     config = resolve(args)
     assert config.state_dir is not None
-    if args.tunnel:
-        if config.server.public_url:
-            source = config.sources.get("server.public_url", "config")
-            raise CliError(f"--tunnel sets the public URL itself; remove server.public_url (set by {source})", code=2)
-        if config.server.auth == "none":
-            raise CliError("--tunnel needs auth path-token or bearer; auth 'none' would publish the server", code=2)
+    keep_token = _check_tunnel(args, config)
     lock = instance.Lock.acquire(config.state_dir)
     if lock is None:
         pid = instance.holder(config.state_dir)
         if pid is not None:
-            raise CliError(f"already running for {config.workspace}, PID {pid}; use dev-link stop")
+            raise CliError(
+                f"already running for {config.workspace}, PID {pid}; use dev-link stop{where_args(args, config)}"
+            )
         # The holder exited between the two checks.
         lock = instance.Lock.acquire(config.state_dir)
         if lock is None:
@@ -61,9 +64,15 @@ def cmd_serve(args: argparse.Namespace) -> int:
     tunnel: Tunnel | None = None
     previous = signal.signal(signal.SIGTERM, _terminate)
     try:
+        if keep_token:
+            # After the lock, so two starts for one workspace cannot each write a different token.
+            config.server.token = _kept_token(config.state_dir / instance.TOKEN_FILE, renew=args.new_token)
         if args.tunnel:
             tunnel = Tunnel.start(
-                config.base_url(), config.state_dir / instance.TUNNEL_LOG, secrets=[config.server.token]
+                config.base_url(),
+                config.state_dir / instance.TUNNEL_LOG,
+                secrets=[config.server.token],
+                ngrok_url=config.tunnel.ngrok_url,
             )
             config.server.public_url = tunnel.url
         configure_logging(config)
@@ -88,6 +97,48 @@ def cmd_serve(args: argparse.Namespace) -> int:
         signal.signal(signal.SIGTERM, previous)
         lock.release()
     return 0
+
+
+def _check_tunnel(args: argparse.Namespace, config: Config) -> bool:
+    """Whether this start keeps its token in the state dir: --tunnel on an ngrok URL with no token
+    set by the user. Raises CliError (status 2) for --tunnel or --new-token flags that do not fit
+    the config."""
+    if args.tunnel:
+        if config.server.public_url:
+            source = config.sources.get("server.public_url", "config")
+            raise CliError(f"--tunnel sets the public URL itself; remove server.public_url (set by {source})", code=2)
+        if config.server.auth == "none":
+            raise CliError("--tunnel needs auth path-token or bearer; auth 'none' would publish the server", code=2)
+    keep_token = bool(args.tunnel and config.tunnel.ngrok_url)
+    if args.new_token and not keep_token:
+        raise CliError("--new-token only applies with --tunnel and an ngrok URL (tunnel.ngrok_url)", code=2)
+    if keep_token and config.sources.get("server.token", "default") != "default":
+        if args.new_token:
+            source = config.sources["server.token"]
+            raise CliError(f"--new-token cannot replace a token set by {source}", code=2)
+        return False
+    return keep_token
+
+
+def _kept_token(path: Path, *, renew: bool) -> str:
+    """The token saved at `path`, or a new random one written there (0600) when the file is
+    missing or `renew` is set. Raises CliError for a file that holds no valid token."""
+    if not renew:
+        try:
+            token = path.read_text().strip()
+        except FileNotFoundError:
+            pass
+        except (OSError, UnicodeDecodeError) as exc:
+            problem = f"cannot read the kept token in {path} ({exc})"
+            raise CliError(f"{problem}; start with --new-token to replace it") from None
+        else:
+            if not _KEPT_TOKEN.fullmatch(token):
+                raise CliError(f"{path} does not hold a valid token; start with --new-token to replace it")
+            return token
+    token = secrets.token_urlsafe(24)
+    with os.fdopen(open_private(path), "w") as f:
+        f.write(token + "\n")
+    return token
 
 
 def configure_logging(config: Config) -> None:
@@ -116,13 +167,19 @@ def _server_flags(args: argparse.Namespace) -> list[str]:
         ("--auth", args.auth),
         ("--log-level", args.log_level),
         ("--public-url", args.public_url),
+        ("--ngrok-url", args.ngrok_url),
     ):
         if value is not None:
             out += [flag, str(value)]
     for flag, values in (("--enable", args.enable), ("--disable", args.disable), ("--allowed-host", args.allowed_host)):
         for value in values:
             out += [flag, value]
-    for flag, on in (("--no-sandbox", args.no_sandbox), ("--no-network", args.no_network), ("--tunnel", args.tunnel)):
+    for flag, on in (
+        ("--no-sandbox", args.no_sandbox),
+        ("--no-network", args.no_network),
+        ("--tunnel", args.tunnel),
+        ("--new-token", args.new_token),
+    ):
         if on:
             out.append(flag)
     return out
@@ -157,9 +214,12 @@ def cmd_start(args: argparse.Namespace) -> int:
     config = resolve(args)
     state = config.state_dir
     assert state is not None
+    # serve checks these too, but only after it was started; this way the error comes straight back.
+    keeps_token = _check_tunnel(args, config)
+    where = where_args(args, config)
     pid = instance.holder(state)
     if pid is not None:
-        raise CliError(f"already running for {config.workspace}, PID {pid}; use dev-link stop")
+        raise CliError(f"already running for {config.workspace}, PID {pid}; use dev-link stop{where}")
     port = _choose_port(config)
     config.server.port = port
     (state / instance.CONNECTION_FILE).unlink(missing_ok=True)
@@ -189,7 +249,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             )
         if time.monotonic() >= deadline:
             raise CliError(
-                f"the server did not answer {health} in time (PID {proc.pid} is still running; dev-link stop"
+                f"the server did not answer {health} in time (PID {proc.pid} is still running; dev-link stop{where}"
                 f" stops it); last lines of {log_path}:",
                 details=instance.tail(log_path, 100),
             )
@@ -198,7 +258,6 @@ def cmd_start(args: argparse.Namespace) -> int:
             if info is not None and info.get("pid") == proc.pid:
                 break
         time.sleep(0.2)
-    where = where_args(args, config)
     lines = [f"dev-link started for {config.workspace}", "", f"  MCP URL   : {info.get('mcp_url', '?')}"]
     lines.append(f"  dashboard : {info.get('dashboard_url', '?')}")
     for label, key in (("public MCP URL", "public_mcp_url"), ("public dash", "public_dashboard_url")):
@@ -210,8 +269,14 @@ def cmd_start(args: argparse.Namespace) -> int:
         f"  PID       : {proc.pid}",
         f"  logs      : {log_path}",
         "",
-        "The token in these URLs is new on every start; anyone with the URL can use the server.",
     ]
+    if keeps_token:
+        lines.append(
+            "The public MCP URL stays the same across restarts; anyone with it can use the server."
+            " --new-token replaces its token."
+        )
+    else:
+        lines.append("The token in these URLs is new on every start; anyone with the URL can use the server.")
     if "public_mcp_url" in info:
         lines.append("The public URL is reachable from the internet: anyone with it can run commands here.")
     tokens = _tokens(info)
@@ -219,8 +284,8 @@ def cmd_start(args: argparse.Namespace) -> int:
     # token, and with --tunnel the public URL, would give anyone who reads it the server.
     hide = bool(tokens) and not sys.stdout.isatty()
     if hide:
-        lines.append(f"The token is hidden because this output is not a terminal; dev-link url {where} prints the URL.")
-    lines += ["", "Commands:", *(f"  dev-link {cmd} {where}" for cmd in ("status", "url", "logs server", "stop"))]
+        lines.append(f"The token is hidden because this output is not a terminal; dev-link url{where} prints the URL.")
+    lines += ["", "Commands:", *(f"  dev-link {cmd}{where}" for cmd in ("status", "url", "logs server", "stop"))]
     text = "\n".join(lines)
     print(redact(text, tokens) if hide else text)
     return 0
@@ -255,7 +320,10 @@ def cmd_stop(args: argparse.Namespace) -> int:
 
 
 def cmd_restart(args: argparse.Namespace) -> int:
-    _stop(resolve(args))
+    config = resolve(args)
+    # Flags that start would refuse must not cost the running server.
+    _check_tunnel(args, config)
+    _stop(config)
     return cmd_start(args)
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import shlex
+from pathlib import Path
 from typing import Any
 
 from dev_link_mcp.config import Config, load_config
@@ -48,6 +49,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
             "public_url": a.get("public_url"),
             "allowed_hosts": a.get("allowed_host") or [],
         },
+        "tunnel": {"ngrok_url": a.get("ngrok_url")},
         "sandbox": {
             "backend": "none" if a.get("no_sandbox") else None,
             "network": False if a.get("no_network") else None,
@@ -66,10 +68,20 @@ def resolve(args: argparse.Namespace) -> Config:
 
 
 def where_args(args: argparse.Namespace, config: Config) -> str:
-    """DIR plus the --config/--state-dir flags that find this instance again, shell-quoted."""
-    parts = [str(config.workspace)]
+    """The DIR and --config/--state-dir arguments that find this instance again, shell-quoted,
+    with a leading space; empty when none are needed. DIR is left out when it is the current
+    folder, its default."""
+    parts = [] if config.workspace == _cwd() else [str(config.workspace)]
     if vars(args).get("config") is not None:
         parts += ["--config", str(args.config)]
     if vars(args).get("state_dir") is not None:
         parts += ["--state-dir", str(config.state_dir)]
-    return shlex.join(parts)
+    return f" {shlex.join(parts)}" if parts else ""
+
+
+def _cwd() -> Path | None:
+    try:
+        return Path.cwd().resolve()
+    except OSError:
+        # The current folder was deleted; then DIR is always printed.
+        return None

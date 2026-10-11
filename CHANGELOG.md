@@ -9,6 +9,19 @@ format may change between minor releases; every such change is listed here.
 
 ## [Unreleased]
 
+### Added
+
+- `tunnel.ngrok_url` (`--ngrok-url`): with `--tunnel`, publish through ngrok on your free fixed
+  domain instead of a Cloudflare quick tunnel. The token is kept per folder in the state dir, so
+  the public URL stays the same across restarts and ChatGPT or Grok need no re-adding.
+  `--new-token` replaces the kept token.
+- The install script asks whether to install cloudflared, ngrok or both, and for ngrok adds the
+  authtoken and writes the domain to the user config.
+
+### Changed
+
+- The commands that `dev-link start` suggests leave out the folder when you are already in it.
+
 ## [0.1.0]
 
 First public release.

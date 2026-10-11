@@ -25,6 +25,8 @@ LOCK_FILE = "server.lock"
 SERVER_LOG = "server.log"
 TUNNEL_LOG = "tunnel.log"
 CONNECTION_FILE = "connection.json"
+# The token kept across restarts when the server is published on a fixed ngrok URL.
+TOKEN_FILE = "token"  # noqa: S105 (a file name, not a password)
 
 PORT_SEARCH = 100
 

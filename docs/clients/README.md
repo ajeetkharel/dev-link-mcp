@@ -1,8 +1,12 @@
 # Connecting clients
 
 dev-link speaks MCP over Streamable HTTP only; there is no stdio mode. Every client connects to
-the URL that `dev-link url DIR` prints, and the token in that URL is the password (see
+the URL that `dev-link url` prints, and the token in that URL is the password (see
 [security.md](../security.md)).
+
+The commands on these pages are run in the project folder. Every `dev-link` command also takes
+the folder as an optional last argument, such as `dev-link url ~/code/my-app`, for running it
+from somewhere else.
 
 How you connect depends on where the client runs:
 

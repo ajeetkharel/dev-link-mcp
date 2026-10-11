@@ -259,6 +259,19 @@
       "title": "ToolsConfig",
       "type": "object"
     },
+    "TunnelConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "ngrok_url": {
+          "default": "",
+          "description": "Your ngrok domain, e.g. `https://name.ngrok-free.app`. With `--tunnel` the server is published there through ngrok instead of a Cloudflare quick tunnel, and the token is kept in the state directory, so the public URL stays the same across restarts. Empty means a quick tunnel.",
+          "title": "Ngrok Url",
+          "type": "string"
+        }
+      },
+      "title": "TunnelConfig",
+      "type": "object"
+    },
     "NoSettings": {
       "additionalProperties": false,
       "description": "Settings of a group that has none: any key under `groups.<name>` is an error.",
@@ -394,6 +407,10 @@
     "server": {
       "$ref": "#/$defs/ServerConfig",
       "description": "Network address and authentication."
+    },
+    "tunnel": {
+      "$ref": "#/$defs/TunnelConfig",
+      "description": "How `--tunnel` publishes the server."
     },
     "sandbox": {
       "$ref": "#/$defs/SandboxConfig",

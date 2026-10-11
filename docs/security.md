@@ -11,21 +11,25 @@ can run commands on this machine with the access described below. With `--tunnel
 URL works from anywhere on the internet. Treat both like a password.
 
 - A new random token is generated on every start, unless you pin one with `--token` or
-  `server.token`. To rotate a token, restart the server (`dev-link restart DIR`) with no pinned
+  `server.token`. To rotate a token, restart the server (`dev-link restart`) with no pinned
   token. A pinned token stays valid until you change it.
+- With `--tunnel` and an ngrok domain (`tunnel.ngrok_url`), the token is kept in `token` (0600
+  in the state dir, which the sandbox cannot see) so the public URL stays the same. It stays
+  valid until you start with `--new-token`.
 - The dashboard URL contains the same token. In `bearer` mode the MCP endpoint wants an
   `Authorization` header, but the dashboard still uses the token in its path, because a
   browser cannot add a header to a page load.
 - The token is written only to `connection.json` (0600 in the state dir), which `dev-link url`
-  reads. Everywhere else it is replaced with `***` before it is written: the audit log,
+  reads, and with an ngrok URL also to `token` next to it. Everywhere else it is replaced with `***` before it is written: the audit log,
   background process logs, `server.log`, `tunnel.log` and every server log line. The startup
   banner and the output of `dev-link start` show the token only when their output is a terminal. Request logging is off. A
   background process that stops for more than 0.2 s in the middle of printing the token leaves
   the part before the pause in its log.
 - The server speaks plain HTTP. On the default `127.0.0.1` that stays on your machine. If you
   bind to a LAN address with `--host`, the token crosses the network unencrypted.
-- `--tunnel` runs a Cloudflare quick tunnel. TLS ends at Cloudflare, so Cloudflare handles the
-  token and all traffic in clear text.
+- `--tunnel` runs a Cloudflare quick tunnel, or ngrok when `tunnel.ngrok_url` is set. TLS ends
+  at Cloudflare or ngrok, which then handles the token and all traffic in clear text. ngrok runs
+  with `--inspect=false`, so its local inspector on port 4040 keeps no requests.
 - `auth: none` is only accepted on a loopback host (`127.0.0.1`, `localhost`, `::1`). The server
   refuses to start with `none` on any other host, together with `public_url` or `allowed_hosts`,
   or with `--tunnel`. A configured token is ignored with `none`. Even on loopback, every local

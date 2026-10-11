@@ -4,12 +4,12 @@ These clients run on the same machine as dev-link and connect to it on `127.0.0.
 Codex CLI, Cursor and VS Code. Start a server and print its URL:
 
 ```bash
-dev-link start DIR
-dev-link url DIR        # http://127.0.0.1:8765/mcp/<token>
+dev-link start
+dev-link url    # http://127.0.0.1:8765/mcp/<token>
 ```
 
 Every client below takes that URL as a remote HTTP server. The token in the path is the
-password: anyone with the URL can run commands in DIR (see [security.md](../security.md)).
+password: anyone with the URL can run commands in that folder (see [security.md](../security.md)).
 
 ## The URL changes on restart
 
@@ -22,23 +22,23 @@ is busy. A URL saved in a client config stops working after a restart. You have 
 
   ```bash
   export DEV_LINK_SERVER__TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
-  dev-link start DIR --port 8765
+  dev-link start --port 8765
   ```
 
   The same works with `server.token` and `server.port` in `~/.config/dev-link/config.yaml`. A
   pinned token never expires, so keep it out of anything you commit.
-- Use `bearer` auth (`dev-link start DIR --auth bearer`). The URL becomes
+- Use `bearer` auth (`dev-link start --auth bearer`). The URL becomes
   `http://127.0.0.1:<port>/mcp` and the token goes in an `Authorization: Bearer <token>` header.
   `dev-link start` prints the header line. This suits clients that can read the header from an
   environment variable, so the token stays out of the config file.
 
-`dev-link url DIR` always prints the current URL, and `dev-link status DIR` shows whether the
+`dev-link url` always prints the current URL, and `dev-link status` shows whether the
 server runs.
 
 ## Claude Code
 
 ```bash
-claude mcp add --transport http dev-link "$(dev-link url DIR)"
+claude mcp add --transport http dev-link "$(dev-link url)"
 ```
 
 Options come before the name and URL. `--scope` picks where the entry goes:
@@ -47,7 +47,7 @@ Options come before the name and URL. `--scope` picks where the entry goes:
 - `user`: `~/.claude.json`, for all your projects.
 - `project`: `.mcp.json` in the project root, meant to be committed. Do not put a token there.
   `.mcp.json` expands `${VAR}` in `url` and `headers`, so a committed file can read the URL
-  from your environment instead (set `DEVLINK_URL` to the output of `dev-link url DIR`; names
+  from your environment instead (set `DEVLINK_URL` to the output of `dev-link url`; names
   starting with `DEV_LINK_` are read by dev-link itself):
 
   ```json
@@ -83,7 +83,7 @@ tool_timeout_sec = 600
 or from the command line:
 
 ```bash
-codex mcp add dev-link --url "$(dev-link url DIR)"
+codex mcp add dev-link --url "$(dev-link url)"
 ```
 
 Codex waits 60 s for a tool call by default, less than dev-link's default command timeout of

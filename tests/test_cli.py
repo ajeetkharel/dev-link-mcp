@@ -26,6 +26,7 @@ from conftest import sandbox_flags
 from dev_link_mcp.audit import AuditReader, AuditStore
 from dev_link_mcp.cli import doctor, instance, main
 from dev_link_mcp.cli import serve as serve_cmd
+from dev_link_mcp.cli.common import CliError, config_from_args, where_args
 from dev_link_mcp.cli.main import parse_args, server_parser
 from dev_link_mcp.cli.tunnel import Tunnel
 from dev_link_mcp.config import load_config
@@ -409,6 +410,175 @@ def test_a_missing_cloudflared_has_an_install_hint(tmp_path, workspace, monkeypa
     assert "dev-link: cloudflared is not installed; install it" in capsys.readouterr().err
 
 
+NGROK_URL = "https://fixed-name.ngrok-free.app"
+
+# Prints the record shapes real ngrok 3.39 writes with --log stdout --log-format json; the ready
+# record names the URL it was given.
+FAKE_NGROK = """\
+#!/bin/sh
+echo "$$" > "{pidfile}"
+printf '%s\\n' "$@" > "{argvfile}"
+url=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--url" ]; then url="$2"; fi
+  shift
+done
+echo '{{"lvl":"info","msg":"starting web service","obj":"web","addr":"127.0.0.1:4040"}}'
+echo '{{"lvl":"info","msg":"started tunnel","obj":"tunnels","name":"command_line","url":"'"$url"'"}}'
+exec sleep 300
+"""
+
+# The failure real ngrok prints when the domain is already online, then exits 1.
+BUSY_NGROK = """\
+#!/bin/sh
+echo '{{"lvl":"crit","msg":"command failed","err":"The endpoint is already online. ERR_NGROK_334"}}'
+exit 1
+"""
+
+
+def _fake_ngrok(tmp_path: Path, script: str) -> Path:
+    bin_dir = tmp_path / "fake-ngrok-bin"
+    bin_dir.mkdir(exist_ok=True)
+    exe = bin_dir / "ngrok"
+    exe.write_text(script.format(pidfile=tmp_path / "ngrok.pid", argvfile=tmp_path / "ngrok.argv"))
+    exe.chmod(0o755)
+    return bin_dir
+
+
+def _serve_on_ngrok_once(tmp_path: Path, workspace: Path, cli_env: dict[str, str], *extra: str) -> dict:
+    """Run a foreground `serve --tunnel --ngrok-url` with the fake ngrok until it is ready, stop it,
+    and return its connection.json."""
+    state = tmp_path / "s"
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    proc = subprocess.Popen(
+        [
+            *(sys.executable, "-m", "dev_link_mcp", "serve", str(workspace), "--state-dir", str(state)),
+            *("--port", str(port), "--tunnel", "--ngrok-url", NGROK_URL, *extra, *sandbox_flags()),
+        ],
+        env=cli_env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    tunnel_pid = None
+    try:
+        deadline = time.monotonic() + 60
+        while not (state / "connection.json").exists():
+            assert proc.poll() is None, proc.stderr.read() if proc.stderr else ""
+            assert time.monotonic() < deadline
+            time.sleep(0.1)
+        tunnel_pid = int((tmp_path / "ngrok.pid").read_text())
+        conn = json.loads((state / "connection.json").read_text())
+        stopped = run(cli_env, "stop", str(workspace), "--state-dir", str(state))
+        assert stopped.returncode == 0, stopped.stderr
+        assert proc.wait(15) == 0
+        assert _wait_gone(tunnel_pid, 5)
+        return conn
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        if tunnel_pid is not None and not _gone(tunnel_pid):
+            os.kill(tunnel_pid, signal.SIGKILL)
+
+
+def test_an_ngrok_url_keeps_the_public_url_across_restarts(tmp_path, workspace, cli_env):
+    cli_env["PATH"] = f"{_fake_ngrok(tmp_path, FAKE_NGROK)}{os.pathsep}{cli_env['PATH']}"
+    token_file = tmp_path / "s" / "token"
+    first = _serve_on_ngrok_once(tmp_path, workspace, cli_env)
+    token = token_file.read_text().strip()
+    assert first["public_mcp_url"] == f"{NGROK_URL}/mcp/{token}"
+    assert stat.S_IMODE(token_file.stat().st_mode) == 0o600
+    argv = (tmp_path / "ngrok.argv").read_text().splitlines()
+    assert argv[:2] == ["http", first["mcp_url"].split("/mcp/")[0]]
+    assert argv[2:4] == ["--url", NGROK_URL] and "--inspect=false" in argv
+
+    assert _serve_on_ngrok_once(tmp_path, workspace, cli_env)["public_mcp_url"] == first["public_mcp_url"]
+
+    # A token the user set wins and is not written over the kept one.
+    pinned = "pinned-token-0123456789"
+    conn = _serve_on_ngrok_once(tmp_path, workspace, cli_env, "--token", pinned)
+    assert conn["public_mcp_url"] == f"{NGROK_URL}/mcp/{pinned}"
+    assert token_file.read_text().strip() == token
+
+
+def test_start_hints_leave_out_dir_inside_the_workspace(tmp_path, workspace, monkeypatch):
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    args = parse_args(["start", str(workspace), "--state-dir", str(tmp_path / "s")])
+    config = config_from_args(args)
+    monkeypatch.chdir(workspace)
+    assert where_args(args, config) == f" --state-dir {config.state_dir}"
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state-root"))
+    plain = parse_args(["start"])
+    assert where_args(plain, config_from_args(plain)) == ""
+    monkeypatch.chdir(other)
+    assert where_args(args, config) == f" {workspace} --state-dir {config.state_dir}"
+
+
+def test_new_token_replaces_the_kept_token(tmp_path):
+    path = tmp_path / "token"
+    first = serve_cmd._kept_token(path, renew=False)
+    assert serve_cmd._kept_token(path, renew=False) == first
+    second = serve_cmd._kept_token(path, renew=True)
+    assert second != first and path.read_text().strip() == second
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    path.write_text("short\n")
+    with pytest.raises(CliError, match="--new-token"):
+        serve_cmd._kept_token(path, renew=False)
+    path.write_bytes(b"\xff\xfe")
+    with pytest.raises(CliError, match="cannot read the kept token"):
+        serve_cmd._kept_token(path, renew=False)
+
+
+@pytest.mark.parametrize(
+    ("flags", "message"),
+    [
+        (["--tunnel", "--new-token"], "--new-token only applies with --tunnel and an ngrok URL"),
+        (["--new-token"], "--new-token only applies with --tunnel and an ngrok URL"),
+        (
+            ["--tunnel", "--ngrok-url", NGROK_URL, "--token", "pinned-token-0123456789", "--new-token"],
+            "--new-token cannot replace a token set by cli",
+        ),
+    ],
+)
+@pytest.mark.parametrize("command", ["serve", "start", "restart"])
+def test_new_token_needs_a_kept_token(tmp_path, workspace, capsys, flags, message, command):
+    # start checks before it spawns serve, so the error names --token, not the variable it uses.
+    with pytest.raises(SystemExit) as exc:
+        main([command, str(workspace), "--state-dir", str(tmp_path / "s"), *flags])
+    assert exc.value.code == 2
+    assert message in capsys.readouterr().err
+
+
+def test_ngrok_url_needs_tunnel(capsys):
+    with pytest.raises(SystemExit) as exc:
+        parse_args(["serve", "--ngrok-url", NGROK_URL])
+    assert exc.value.code == 2
+    assert "--ngrok-url only applies with --tunnel" in capsys.readouterr().err
+
+
+def test_an_ngrok_failure_reports_its_log(tmp_path, workspace, monkeypatch, capsys):
+    monkeypatch.setenv("PATH", f"{_fake_ngrok(tmp_path, BUSY_NGROK)}{os.pathsep}{os.environ['PATH']}")
+    with pytest.raises(SystemExit) as exc:
+        main(["serve", str(workspace), "--state-dir", str(tmp_path / "s"), "--tunnel", "--ngrok-url", NGROK_URL])
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert err.startswith("dev-link: ngrok exited with code 1 before it printed a tunnel URL")
+    assert "ERR_NGROK_334" in err
+    assert instance.holder(tmp_path / "s") is None
+
+
+def test_a_missing_ngrok_has_an_install_hint(tmp_path, workspace, monkeypatch, capsys):
+    monkeypatch.setattr(shutil, "which", lambda name, *a, **k: None)
+    with pytest.raises(SystemExit) as exc:
+        main(["serve", str(workspace), "--state-dir", str(tmp_path / "s"), "--tunnel", "--ngrok-url", NGROK_URL])
+    assert exc.value.code == 1
+    assert "dev-link: ngrok is not installed; install it and add your authtoken" in capsys.readouterr().err
+
+
 # --- doctor, config, tools -------------------------------------------------------------------
 
 
@@ -691,12 +861,12 @@ def test_open_private_narrows_an_existing_file(tmp_path):
         os.close(fd)
 
 
-def _every_server_flag(skip: str) -> list[str]:
-    """argv that sets every server option except `skip`, with a value of the right shape."""
+def _every_server_flag(skip: tuple[str, ...]) -> list[str]:
+    """argv that sets every server option except those in `skip`, with a value of the right shape."""
     argv: list[str] = []
     for action in server_parser()._actions:
         flag = action.option_strings[-1] if action.option_strings else None
-        if flag is None or flag in ("-h", "--help", skip):
+        if flag is None or flag in ("-h", "--help", *skip):
             continue
         if action.nargs == 0:
             argv.append(flag)
@@ -711,7 +881,8 @@ def _every_server_flag(skip: str) -> list[str]:
     return argv
 
 
-@pytest.mark.parametrize("skip", ["--tunnel", "--public-url"])
+# --tunnel and --public-url cannot go together, and --ngrok-url needs --tunnel.
+@pytest.mark.parametrize("skip", [("--tunnel", "--ngrok-url"), ("--public-url",)])
 def test_start_forwards_every_server_flag(skip):
     start = parse_args(["start", "/w", "-c", "/c.yaml", *_every_server_flag(skip)])
     served = parse_args(["serve", "/w", *serve_cmd._server_flags(start)])

@@ -16,7 +16,7 @@ from typing import Literal, NamedTuple
 
 from dev_link_mcp.cli import instance
 from dev_link_mcp.cli.common import config_from_args
-from dev_link_mcp.cli.tunnel import INSTALL_DOCS
+from dev_link_mcp.cli.tunnel import INSTALL_DOCS, NGROK_INSTALL_DOCS
 from dev_link_mcp.config import Config
 from dev_link_mcp.sandbox.backends.bubblewrap import Bubblewrap
 from dev_link_mcp.sandbox.limits import ResourceLimits
@@ -42,13 +42,20 @@ def _chromium() -> str | None:
     return path if path and Path(path).exists() else None
 
 
-def _programs(tunnel: bool) -> list[Check]:
-    checks = []
-    for name, fix, needed in (
+def _programs(tunnel: bool, ngrok_url: str) -> list[Check]:
+    """Checks for the external programs. ngrok is only listed when an ngrok URL is configured,
+    and then it replaces cloudflared as the program --tunnel needs."""
+    programs = [
         ("git", "install git; checkpoints and apply_patch need it", False),
         ("rg", "install ripgrep (e.g. apt install ripgrep or brew install ripgrep); the search tools need it", False),
-        ("cloudflared", f"install cloudflared (see {INSTALL_DOCS}); only --tunnel needs it", tunnel),
-    ):
+        ("cloudflared", f"install cloudflared (see {INSTALL_DOCS}); only --tunnel needs it", tunnel and not ngrok_url),
+    ]
+    if ngrok_url:
+        programs.append(
+            ("ngrok", f"install ngrok and add your authtoken (see {NGROK_INSTALL_DOCS}); --tunnel needs it", tunnel)
+        )
+    checks = []
+    for name, fix, needed in programs:
         path = shutil.which(name)
         if path:
             checks.append(Check("ok", name, path))
@@ -172,7 +179,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         checks.append(Check("ok", "config", f"workspace {config.workspace}"))
         checks.append(_sandbox(config))
         checks.append(_limits(config))
-    checks += _programs(bool(args.tunnel))
+    checks += _programs(bool(args.tunnel), config.tunnel.ngrok_url if config is not None else "")
     if config is not None:
         checks += _groups(config)
         checks += _state_and_port(config)

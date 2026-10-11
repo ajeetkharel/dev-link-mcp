@@ -1,7 +1,9 @@
-"""A Cloudflare quick tunnel run by the server as a child process."""
+"""A public tunnel run by the server as a child process: a Cloudflare quick tunnel, or ngrok on
+the user's fixed domain."""
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -27,36 +29,56 @@ INSTALL_HINT = (
     f"cloudflared is not installed; install it (Linux: {INSTALL_DOCS}, macOS: brew install cloudflared)"
     " or start without --tunnel"
 )
+NGROK_INSTALL_DOCS = (
+    "https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/clients/web.md#a-url-that-stays-the-same"
+)
+NGROK_INSTALL_HINT = (
+    f"ngrok is not installed; install it and add your authtoken (see {NGROK_INSTALL_DOCS})"
+    " or remove tunnel.ngrok_url to use a quick tunnel"
+)
 
 
 class Tunnel:
-    """A running `cloudflared tunnel --url` whose public URL is known."""
+    """A running cloudflared or ngrok whose public URL is known."""
 
-    def __init__(self, proc: subprocess.Popen[bytes], url: str, copier: threading.Thread):
+    def __init__(self, proc: subprocess.Popen[bytes], url: str, copier: threading.Thread, program: str):
         self.proc = proc
         self.url = url
         self._copier = copier
+        self._program = program
 
     @classmethod
-    def start(cls, local_url: str, log_path: Path, *, secrets: list[str], timeout_s: float = 30) -> Tunnel:
-        """Start cloudflared for `local_url` and wait for its trycloudflare.com URL.
+    def start(
+        cls, local_url: str, log_path: Path, *, secrets: list[str], ngrok_url: str = "", timeout_s: float = 30
+    ) -> Tunnel:
+        """Start a tunnel for `local_url` and wait until its public URL is up.
 
+        With `ngrok_url` empty this is a cloudflared quick tunnel on a random trycloudflare.com
+        URL; otherwise ngrok on that fixed URL, using the authtoken from ngrok's own config.
         Output goes to `log_path` (truncated, 0600) through a thread that replaces each of
-        `secrets` with ***: cloudflared logs the full URL of a request it cannot pass on, path
-        token included. cloudflared runs in its own session, so Ctrl+C and `dev-link stop`
-        reach only the server, which stops the tunnel first on its way down; if the server dies
-        without doing that, the orphan guard kills it. Raises CliError, with the last 100 log
-        lines, when cloudflared is missing, exits early or prints no URL within `timeout_s`.
+        `secrets` with ***: both programs can log the full URL of a request, path token
+        included. The tunnel runs in its own session, so Ctrl+C and `dev-link stop` reach only
+        the server, which stops the tunnel first on its way down; if the server dies without
+        doing that, the orphan guard kills it. Raises CliError, with the last 100 log lines,
+        when the program is missing, exits early or reports no URL within `timeout_s`.
         """
         from dev_link_mcp.audit import StreamRedactor
 
-        exe = shutil.which("cloudflared")
+        program = "ngrok" if ngrok_url else "cloudflared"
+        exe = shutil.which(program)
         if exe is None:
-            raise CliError(INSTALL_HINT)
+            raise CliError(NGROK_INSTALL_HINT if ngrok_url else INSTALL_HINT)
+        if ngrok_url:
+            # --inspect=false keeps ngrok's local inspector on port 4040 from storing requests,
+            # whose paths carry the token.
+            argv = [exe, "http", local_url, "--url", ngrok_url, "--log", "stdout", "--log-format", "json"]
+            argv.append("--inspect=false")
+        else:
+            argv = [exe, "tunnel", "--no-autoupdate", "--url", local_url]
         log_file = os.fdopen(open_private(log_path), "wb", buffering=0)
         try:
             proc = subprocess.Popen(
-                [exe, "tunnel", "--no-autoupdate", "--url", local_url],
+                argv,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -74,14 +96,15 @@ class Tunnel:
         deadline = time.monotonic() + timeout_s
         try:
             while True:
-                match = _URL.search(log_path.read_text(errors="replace"))
-                if match:
-                    return cls(proc, match.group(0), copier)
+                text = log_path.read_text(errors="replace")
+                url = _ngrok_ready(text, ngrok_url) if ngrok_url else _quick_url(text)
+                if url:
+                    return cls(proc, url, copier, program)
                 if proc.poll() is not None:
-                    problem = f"cloudflared exited with code {proc.returncode} before it printed a tunnel URL"
+                    problem = f"{program} exited with code {proc.returncode} before it printed a tunnel URL"
                     break
                 if time.monotonic() >= deadline:
-                    problem = f"cloudflared printed no tunnel URL within {timeout_s:.0f} s"
+                    problem = f"{program} printed no tunnel URL within {timeout_s:.0f} s"
                     break
                 time.sleep(0.25)
         except BaseException:
@@ -101,7 +124,28 @@ class Tunnel:
         if self.proc.poll() is None:
             return None
         orphans.forget(self.proc.pid)
-        return f"cloudflared exited with code {self.proc.returncode}, so {self.url} no longer works"
+        return f"{self._program} exited with code {self.proc.returncode}, so {self.url} no longer works"
+
+
+def _quick_url(text: str) -> str | None:
+    match = _URL.search(text)
+    return match.group(0) if match else None
+
+
+def _ngrok_ready(text: str, url: str) -> str | None:
+    """`url` once an info record of ngrok's JSON log names it, else None. The match is on the
+    `url` field rather than the message text, which ngrok does not document."""
+    for line in text.splitlines():
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(record, dict) or record.get("lvl") != "info":
+            continue
+        found = record.get("url")
+        if isinstance(found, str) and found.rstrip("/") == url:
+            return url
+    return None
 
 
 def _terminate(proc: subprocess.Popen[bytes], copier: threading.Thread) -> None:

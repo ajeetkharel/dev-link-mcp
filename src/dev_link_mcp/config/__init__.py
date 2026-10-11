@@ -11,6 +11,7 @@ from dev_link_mcp.config.models import (
     SandboxConfig,
     ServerConfig,
     ToolsConfig,
+    TunnelConfig,
     default_state_root,
 )
 
@@ -24,6 +25,7 @@ __all__ = [
     "SandboxConfig",
     "ServerConfig",
     "ToolsConfig",
+    "TunnelConfig",
     "default_state_root",
     "default_user_file",
     "describe_errors",
