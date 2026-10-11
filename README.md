@@ -7,7 +7,11 @@
 <!-- mcp-name: io.github.ajeetkharel/dev-link-mcp -->
 
 <p align="center">
-  Turn the AI you already use, whether ChatGPT, Grok, Claude Code, Codex, Cursor or VS Code, into a coding agent for one folder on your machine, sandboxed and logged on a live dashboard.
+  <strong>Your AI. Your project. A real development workspace.</strong>
+</p>
+
+<p align="center">
+  Connect your AI client to a project on your machine. Edit code, run tests, manage dev servers and drive a browser, with a live dashboard to follow the work.
 </p>
 
 <p align="center">
@@ -19,232 +23,302 @@
 
 ![The dev-link dashboard during an agent session: activity feed, background processes, workspace files, tasks and notes](https://raw.githubusercontent.com/ajeetkharel/dev-link-mcp/main/docs/assets/dashboard.gif)
 
-**What.** dev-link is an MCP server that runs on your machine and gives your AI a complete
-development environment for one project folder: 78 tools that read and edit files, search code,
-run commands, keep dev servers running, build, lint and test, navigate code, call HTTP APIs, query
-SQLite, JSON and CSV, take checkpoints, keep a task list and drive a headless browser, plus
-Docker when you turn it on. [Tools](#tools) lists every one.
+[Quick start](#quick-start) · [Capabilities](#capabilities) · [Tunnels](#tunnels) · [Security](#security) · [Documentation](#documentation)
 
-**Why.** Web chats such as ChatGPT and Grok can add a custom MCP server, and so can every coding
-agent and editor, including Claude Code, Codex CLI, Cursor and VS Code. dev-link gives any of them
-the same development environment, with no API key and no extra model bill. The folder is sandboxed,
-and every call is logged on a dashboard you can watch.
+## What is dev-link?
 
-**How.** Start a server for the folder, then paste its URL into your client as a remote MCP server.
-Any client that gains MCP support later works the same way.
+dev-link is an open-source [Model Context Protocol (MCP)](https://modelcontextprotocol.io/)
+server that gives an AI client tools to work on a project folder on your machine.
+Your client sends tool calls; dev-link runs them and returns the results.
+
+Use it to bring a local project into a web chat such as ChatGPT or Grok, or to give an editor or
+CLI agent the same workspace tools and dashboard. It works with clients that support remote MCP
+servers over Streamable HTTP, including Claude Code, Codex CLI, Cursor and VS Code.
+
+dev-link runs no model and requires no model API key of its own. Your AI client's plan,
+usage limits and MCP support still apply.
+
+- **Work on the actual project.** Read and edit files, search code, run builds and tests, and
+  keep development servers running between tool calls.
+- **Check the app in a browser.** Navigate pages, interact with the UI, inspect console and
+  network activity, and take screenshots with Playwright.
+- **Follow the work.** Watch tool calls and results, running processes, files, tasks and notes
+  in the dashboard. Tool calls are also recorded in an audit log.
+- **Save a recovery point.** Create, compare and restore workspace checkpoints before risky edits.
+- **Choose how to connect.** Connect locally, or use built-in ngrok and Cloudflare tunnel support
+  for web clients. Linux commands run in a bubblewrap sandbox by default.
+
+**Status:** Alpha. Linux is supported; macOS is experimental and requires `--no-sandbox`.
+Windows is not supported. See [platforms](#platforms) and [security](#security) before starting.
 
 ## Quick start
 
+### 1. Install
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ajeetkharel/dev-link-mcp/main/scripts/install.sh | sh
-cd your-project && dev-link start . --tunnel    # prints the URL to give your client
 ```
 
-Copy the `public MCP URL` from the output and add it to your AI client as a custom (remote) MCP
-server with no authentication. [What you will see](#what-you-will-see) shows the output, and
-[Add it to your client](#add-it-to-your-client) says where to paste it.
+The [install script](https://github.com/ajeetkharel/dev-link-mcp/blob/main/scripts/install.sh)
+sets up uv, dev-link, Chromium and system dependencies. On Linux it uses your package manager
+for bubblewrap, git and ripgrep and may request sudo. Open a new terminal if `dev-link` is
+not found after installation.
 
-Using a client on this machine (Claude Code, Codex, Cursor, VS Code)? Drop `--tunnel`.
+In an interactive terminal, the installer offers ngrok, cloudflared, both or neither.
+Choose **ngrok** for a reusable public URL or **cloudflared** for a temporary URL without an
+account. ngrok setup needs your account's authtoken and assigned domain. Without a terminal,
+the installer defaults to cloudflared unless configured otherwise.
 
-The [install script](https://github.com/ajeetkharel/dev-link-mcp/blob/main/scripts/install.sh) installs uv, dev-link, Chromium for the browser tools
-and cloudflared, and on Linux the bubblewrap sandbox, git and ripgrep through your package manager,
-so it asks for sudo. To install by hand instead, see [Requirements](#requirements).
+Prefer to install dependencies yourself? See [manual installation](#manual-installation).
 
-## Why
+### 2. Start in your project folder
 
-The model stays in your client. dev-link talks to no model and needs no API key, so the plan you
-already pay for does the work. dev-link uses only standard MCP over Streamable HTTP, with the token
-in the URL or in a bearer header, so it works with any client that can add a remote MCP server
-that way.
+For a **web client**, start with a public tunnel:
 
-dev-link adds what a chat window or an editor lacks: your files, a shell and a browser.
+```bash
+cd ~/code/my-project
+dev-link start --tunnel
+```
 
-You expose one folder, not your machine. On Linux every command runs in a bubblewrap sandbox
-where that folder is writable, system tools are read-only, and your home, SSH keys and other
-projects are not there.
+For an **editor or CLI on the same machine**, start locally:
 
-Every tool call is saved with its arguments and result to an audit log outside the folder. The
-dashboard shows the calls as they happen, along with running processes, the agent's task list
-and the workspace files.
+```bash
+cd ~/code/my-project
+dev-link start
+```
 
-The agent gets a development environment, not just file access. It can run any command, install
-packages, start a dev server and wait for its port, click through the app in a headless browser,
-and take checkpoints it can diff and restore.
-
-## What you will see
-
-`dev-link start . --tunnel` prints this (the token and hostname are random on every start):
+The startup output includes connection and dashboard URLs. For example, with ngrok configured:
 
 ```text
-dev-link started for /home/you/your-project
-
-  MCP URL   : http://127.0.0.1:8765/mcp/<token>
-  dashboard : http://127.0.0.1:8765/ui/<token>/
-  public MCP URL: https://<random>.trycloudflare.com/mcp/<token>
-  public dash: https://<random>.trycloudflare.com/ui/<token>/
-  PID       : 371145
-  logs      : /home/you/.local/state/dev-link-mcp/your-project-<id>/server.log
-
-The token in these URLs is new on every start; anyone with the URL can use the server.
-The public URL is reachable from the internet: anyone with it can run commands here.
+MCP URL        : http://127.0.0.1:8765/mcp/<token>
+dashboard      : http://127.0.0.1:8765/ui/<token>/
+public MCP URL : https://<your-ngrok-domain>/mcp/<token>
+public dash    : https://<your-ngrok-domain>/ui/<token>/
 ```
 
-- **Give your client the `public MCP URL`.** `dev-link url .` prints the same line on its own,
-  which is handy for `$(...)` in a command.
-- **Without `--tunnel`** there are no public lines. Clients on your machine use the `MCP URL`.
-- **Watch the agent work** by opening the `dashboard` URL from your own machine. Keep the
-  `public dash` line to yourself.
-- **Check or stop the server** with `dev-link status .` and `dev-link stop .`. A restart gives a
-  new URL, so add the server to your client again.
+These are illustrative; use the URLs printed by your server. The port may differ.
+Without `--tunnel`, only local URLs are printed.
 
-## Add it to your client
+**Treat these URLs like passwords.** They contain an access token. Anyone with the token can
+use the server's tools, including running commands. Keep the dashboard URL private and read
+[Security](#security) before exposing a workspace.
 
-| Client | Run `start` | Where to paste the URL |
+### 3. Connect your client
+
+| Client | Connect with | Setup guide |
 | --- | --- | --- |
-| ChatGPT | with `--tunnel` | [chatgpt.com/plugins](https://chatgpt.com/plugins), plus button, **Add custom MCP server**, **No authentication** |
-| Grok | with `--tunnel` | [grok.com/connectors](https://grok.com/connectors), **New Connector**, **Custom** |
-| Claude Code, Codex CLI, Cursor, VS Code | without `--tunnel` | the commands and files below |
-| Any other MCP client | `--tunnel` for web, none for local | its "add remote MCP server" setting |
+| ChatGPT or Grok | Add the **public MCP URL** as a custom MCP server/connector | [Web clients](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/clients/web.md) |
+| Claude Code | `claude mcp add --transport http dev-link "$(dev-link url)"` | [Local clients](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/clients/local.md) |
+| Codex CLI | `codex mcp add dev-link --url "$(dev-link url)"` | [Local clients](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/clients/local.md) |
+| Cursor or VS Code | Add the **MCP URL** to your MCP configuration | [Local clients](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/clients/local.md) |
+| Other MCP clients | Add the appropriate URL using **Streamable HTTP** | [Connection and authentication](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/clients/README.md) |
 
-Web chats are covered step by step in [docs/clients/web.md](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/clients/web.md), and
-[docs/clients](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/clients/README.md) covers every client, fixed URLs, bearer auth and how to
-check the connection.
+Run CLI setup commands from the project folder. `dev-link url` prints the public URL when a
+tunnel is active, otherwise the local URL. For the default path-token setup, choose
+**No authentication** if your web client asks: the secret is already in the URL.
+Client availability can depend on your plan and workspace settings.
 
-<details>
-<summary>Claude Code</summary>
+Open the **local dashboard URL** in your browser to follow the session. `dev-link dashboard`
+prints it again.
 
-```bash
-claude mcp add --transport http dev-link "$(dev-link url DIR)"
+### 4. Try it
+
+Start with a task that helps the client understand your project:
+
+> Inspect this project, explain how to run it, run the existing tests and report any failures.
+> Don't change any files yet.
+
+Then try a development workflow:
+
+> Start the development server, open the app in the browser and check the main user flow.
+> Include a screenshot and any console errors in your report.
+
+Or make a focused change:
+
+> Create a checkpoint, fix the failing test, and run the relevant tests again.
+> Show me the diff and explain what changed.
+
+When you're done, run `dev-link stop` to stop the server and its tunnel.
+
+## Capabilities
+
+| What you need | What dev-link provides |
+| --- | --- |
+| Files and search | Read, write and patch files; search with ripgrep; replace across files |
+| Commands and processes | Run shell commands and code snippets; manage background servers and watchers |
+| Code navigation | Inspect outlines, definitions and references with tree-sitter |
+| Build and test | Detect the project stack; install dependencies; build, lint, format and test |
+| Browser automation | Drive Chromium with Playwright; inspect pages, screenshots, console and network activity |
+| APIs and data | Make HTTP requests, download files, query SQLite, and inspect JSON and CSV |
+| Checkpoints | Snapshot, compare and restore workspace files |
+| Tasks and notes | Keep a persistent task list and notes for the workspace |
+| Docker (opt-in) | Work with containers and Compose, subject to workspace restrictions |
+
+Git and other installed CLIs are available through command tools. Browser and code-navigation
+tools need the `[browser]` and `[code]` extras; the installer includes both via `[all]`.
+Docker is disabled by default and requires `--enable docker`; see the security implications below.
+
+For the current tool list and parameters, use `dev-link tools` or the generated
+[tool reference](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/tools.md).
+You can also [add tool groups through plugins](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/extending.md).
+
+## How it works
+
+```text
+Editor / CLI agent ─────── local HTTP ──────────┐
+                                                │
+Web AI client ── HTTPS ── ngrok / cloudflared ──┤
+                                                ▼
+                                    dev-link on your machine
+                                                │
+                            ┌───────────────────┼───────────────────┐
+                            ▼                   ▼                   ▼
+                       Project files     Commands, processes   Dashboard
+                       and checkpoints   and browser tools     and audit log
 ```
 
-After a restart, run `claude mcp remove dev-link` and add it again.
-</details>
+The AI stays in your client. The project and tools run on your machine; tool inputs and results
+travel between them. Connecting a cloud AI client does **not** keep project data entirely local:
+file contents and command output returned by tools can be sent to that client.
 
-<details>
-<summary>Codex CLI</summary>
+The Linux sandbox applies to commands. Some tools, including HTTP and browser tools, run in
+the server process with their own restrictions. See the
+[security model](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/security.md) for the boundaries.
 
-```bash
-codex mcp add dev-link --url "$(dev-link url DIR)"
-```
+## Tunnels
 
-Codex waits 60 s for a tool call by default, less than dev-link's command timeout, so raise it in
-`~/.codex/config.toml`:
+`dev-link start --tunnel` selects the provider from your configuration:
 
-```toml
-[mcp_servers.dev-link]
-url = "http://127.0.0.1:8765/mcp/<token>"
-tool_timeout_sec = 600
-```
-</details>
-
-<details>
-<summary>Cursor</summary>
-
-`~/.cursor/mcp.json` (all projects) or `.cursor/mcp.json` in the project root:
-
-```json
-{
-  "mcpServers": {
-    "dev-link": { "url": "http://127.0.0.1:8765/mcp/<token>" }
-  }
-}
-```
-</details>
-
-<details>
-<summary>VS Code</summary>
-
-`.vscode/mcp.json` in the workspace, or your user `mcp.json`:
-
-```json
-{
-  "servers": {
-    "dev-link": { "type": "http", "url": "http://127.0.0.1:8765/mcp/<token>" }
-  }
-}
-```
-</details>
-
-## Requirements
-
-The install script sets all of this up. By hand:
-
-```bash
-sudo apt install bubblewrap git ripgrep        # or dnf, pacman, zypper, brew
-uv tool install --python 3.13 'dev-link-mcp[all] @ git+https://github.com/ajeetkharel/dev-link-mcp'
-dev-link install-browser                       # Chromium for the browser tools
-```
-
-- **bubblewrap** (Linux): the sandbox. `dev-link start` refuses to run without it, unless you pass
-  `--no-sandbox`, which gives the agent your full user access. Ubuntu 23.10 and later block the
-  user namespaces bubblewrap needs; see the [AppArmor note](https://github.com/ajeetkharel/dev-link-mcp/blob/main/CONTRIBUTING.md#setup).
-- **git and ripgrep**: used by the tools (`sudo apt install git ripgrep`).
-- **cloudflared**: only for `--tunnel`. See [Install cloudflared](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/clients/web.md#install-cloudflared).
-- **macOS** (experimental): runs only with `--no-sandbox`. With `--tunnel` as well, anyone with the public URL gets
-  your full user access.
-
-`dev-link doctor` checks each of these and says how to fix what is missing.
-
-## Tools
-
-78 tools in 13 groups. Every group is on by default except docker (`--enable docker`). The code
-and browser groups need the `[code]` and `[browser]` extras; `[all]` installs both.
-
-| Group | For | Tools |
+| | ngrok | Cloudflare quick tunnel |
 | --- | --- | --- |
-| `system` | workspace and server info | `server_status`, `workspace_info` |
-| `files` | read, write, edit, move and delete files | `read_file`, `read_many_files`, `write_file`, `edit_file`, `multi_edit`, `apply_patch`, `list_dir`, `tree`, `file_info`, `make_dir`, `copy_path`, `move_path`, `delete_path` |
-| `search` | find files, grep, search and replace (ripgrep) | `find_files`, `grep`, `replace_in_files` |
-| `shell` | run commands and code snippets | `run_command`, `run_code` |
-| `processes` | dev servers and watchers in the background | `start_process`, `list_processes`, `process_output`, `process_input`, `wait_for_process`, `stop_process` |
-| `code` | outlines, definitions and references (tree-sitter) | `code_outline`, `code_stats`, `find_symbol`, `find_references` |
-| `project` | detect the stack; install, build, lint, format, test | `project_detect`, `install_deps`, `run_build`, `run_lint`, `run_format`, `run_tests` |
-| `http` | HTTP requests, fetch pages, downloads | `http_request`, `fetch_url`, `download_file` |
-| `data` | SQLite, jq and CSV | `sqlite_query`, `sqlite_schema`, `json_query`, `csv_preview` |
-| `checkpoints` | snapshot, diff and restore the workspace | `checkpoint_create`, `checkpoint_list`, `checkpoint_diff`, `checkpoint_restore` |
-| `tasks` | a persistent task list and notes | `task_add`, `task_list`, `task_update`, `note_write`, `note_read`, `note_list`, `note_delete` |
-| `browser` | a headless Chromium (Playwright) | `browser_open`, `browser_navigate`, `browser_snapshot`, `browser_screenshot`, `browser_click`, `browser_type`, `browser_press`, `browser_select`, `browser_wait`, `browser_eval`, `browser_console`, `browser_network`, `browser_set_viewport`, `browser_list_pages`, `browser_close` |
-| `docker` | containers and compose, limited to the workspace | `docker_run`, `docker_exec`, `docker_ps`, `docker_logs`, `docker_stop`, `docker_rm`, `docker_build`, `docker_images`, `compose` |
+| Setup | ngrok installed, account authenticated, and `tunnel.ngrok_url` configured | cloudflared installed; no account needed |
+| Public address | Your assigned or configured ngrok domain | A temporary `trycloudflare.com` address |
+| After a restart | Same public URL while the domain and saved token remain unchanged | New public URL; reconnect your client |
+| Useful for | Returning to the same workspace regularly | Temporary development sessions |
 
-A group whose extra is missing is reported as not installed. Git, package managers and any
-other CLI run through `run_command`, as in your own terminal. Every tool and its parameters are
-listed in [docs/tools.md](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/tools.md).
+With `tunnel.ngrok_url` set, dev-link uses ngrok. Otherwise it uses cloudflared.
+Installing ngrok alone does not select it. The installer can configure the domain for you;
+for manual setup, see [a URL that stays the same](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/clients/web.md#a-url-that-stays-the-same).
+
+For ngrok, dev-link saves a token per workspace so the public URL survives restarts. To replace
+that saved token, run `dev-link restart --tunnel --new-token`, then reconnect your clients. Explicitly configured tokens must be changed in their configuration instead.
+
+Local starts and Cloudflare quick tunnels generate a new token by default. For a stable local
+connection, see [pinning the token and port](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/clients/local.md#the-url-changes-on-restart).
+
+Provider limits still apply. Check [ngrok's plan limits](https://ngrok.com/docs/pricing-limits/free-plan-limits/)
+and [Cloudflare's quick tunnel documentation](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)
+for current terms. Use the local dashboard URL to avoid ngrok's browser warning page.
+
+## Everyday commands
+
+Run these from your project folder, or pass the folder explicitly, for example
+`dev-link status ~/code/my-project`.
+
+```bash
+dev-link status             # Check the server
+dev-link url                # Print the MCP URL
+dev-link dashboard          # Print the local dashboard URL
+dev-link logs server        # Read server logs
+dev-link logs tunnel        # Read tunnel logs
+dev-link doctor             # Diagnose dependencies and sandbox setup
+dev-link restart --tunnel   # Restart with a public tunnel
+dev-link stop               # Stop the server and its tunnel
+```
+
+Use `dev-link --help` for all commands and
+[Configuration](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/configuration.md)
+for tool selection, environment variables, timeouts and sandbox settings.
 
 ## Security
 
-The MCP URL contains a random token that changes on every start. Anyone with the URL can run
-commands in the folder, so treat it like a password. On Linux, commands run in a bubblewrap
-sandbox that sees the folder, read-only system paths and toolchains, and a private home. The
-network is on by default, so the agent can reach the internet, your LAN and services on
-localhost; `--no-network` turns it off. `--no-sandbox` gives the agent your full user access,
-and the docker group is root-equivalent when you enable it. Details are in
-[docs/security.md](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/security.md);
-report vulnerabilities as described in
+dev-link gives an AI the ability to modify files and execute commands. Connect clients you trust
+and choose the workspace carefully.
+
+- **Protect the token.** MCP and dashboard URLs contain the same secret in the default setup.
+  Do not post them, commit them or include them in screenshots.
+- **The workspace is writable.** The agent can read, change or delete its contents, including
+  `.env` files and `.git`. Checkpoints are useful recovery points, not a replacement for backups.
+- **Linux commands are sandboxed by default.** bubblewrap exposes the workspace, read-only
+  system and toolchain paths, and a private home. Extra mounts can widen access. The sandbox
+  does not make arbitrary commands harmless.
+- **Network access is on by default.** Tools can reach the internet, your LAN and localhost
+  services. `--no-network` restricts network access, including browser and HTTP tools;
+  package installs and workflows that need network access will fail.
+- **Public tunnels expose the server.** ngrok or Cloudflare terminates TLS and handles the
+  traffic, including the token. Stop the server when it is no longer needed.
+- **Some modes grant much broader access.** `--no-sandbox` runs commands with your user access.
+  Enabling Docker with a rootful daemon is effectively root-equivalent access.
+- **Logging is visibility, not prevention.** The dashboard and audit log record activity;
+  they do not approve or block a harmful command.
+
+Read the full [security model](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/security.md)
+for restrictions and known limits. Report vulnerabilities privately through
 [SECURITY.md](https://github.com/ajeetkharel/dev-link-mcp/blob/main/SECURITY.md).
 
 ## Platforms
 
 | Platform | Support |
 | --- | --- |
-| Linux | Supported. Commands run in a bubblewrap sandbox. |
-| macOS | Experimental. Only with `--no-sandbox`, which gives the agent your full user access. Not tested in CI yet, and `wait_for_process` may not see a dev server's port. |
-| Windows | Not supported. |
+| Linux | Supported, with bubblewrap sandboxing by default |
+| macOS | Experimental; requires `--no-sandbox`. Not currently tested in CI; process port detection has known limitations |
+| Windows | Not supported |
+
+The package requires Python 3.11 or newer. The installer uses uv to provision Python 3.13.
+
+## Manual installation
+
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) first. On Debian or Ubuntu:
+
+```bash
+sudo apt install bubblewrap git ripgrep
+uv tool install --python 3.13 'dev-link-mcp[all] @ git+https://github.com/ajeetkharel/dev-link-mcp'
+dev-link install-browser
+dev-link doctor
+```
+
+On other Linux distributions, use the equivalent system packages. macOS needs git and ripgrep,
+but cannot use the bubblewrap sandbox. Browser tools also need Chromium's system libraries;
+the installer handles these on supported Debian/Ubuntu systems.
+
+For web clients, install and configure [ngrok](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/clients/web.md#a-url-that-stays-the-same)
+or [cloudflared](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/clients/web.md#install-cloudflared).
+Local clients do not need a tunnel.
+
+## Troubleshooting
+
+| Symptom | First thing to check |
+| --- | --- |
+| Server refuses to start | Run `dev-link doctor` and `dev-link logs server`. For Ubuntu sandbox restrictions, see the [setup notes](https://github.com/ajeetkharel/dev-link-mcp/blob/main/CONTRIBUTING.md#setup) |
+| Client stops connecting after a restart | Run `dev-link url` and compare it with the saved URL. See [Tunnels](#tunnels) for stable URLs |
+| `--tunnel` asks for cloudflared when ngrok is installed | Configure `tunnel.ngrok_url`; installing ngrok alone does not select it |
+| Public connection fails | Check `dev-link logs tunnel`, your tunnel configuration and provider limits |
+| Browser tools cannot start | Run `dev-link install-browser` and `dev-link doctor`; check for missing Chromium system libraries |
+| A long command times out in the client | Check the client's tool-call timeout as well as dev-link's command timeout; see [local clients](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/clients/local.md) |
+
+If you report a bug, include the failing command, platform and relevant logs, with tokens and
+project secrets removed.
 
 ## Documentation
 
-- [Configuration](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/configuration.md): config files, environment variables and every setting.
-- [Tools](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/tools.md): every tool with its parameters.
-- [Clients](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/clients/README.md): [web](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/clients/web.md) (ChatGPT, Grok) and [local](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/clients/local.md) (Claude Code, Codex CLI, Cursor, VS Code).
-- [Architecture](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/architecture.md): how a tool call flows and where state lives.
-- [Security](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/security.md): what the sandbox holds back and what it does not.
-- [Extending](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/extending.md): tool groups from other packages.
-
-`dev-link --help` lists every command.
+| Guide | Contents |
+| --- | --- |
+| [Client setup](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/clients/README.md) | Web clients, editors, CLI agents and authentication |
+| [Configuration](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/configuration.md) | Settings, environment variables and tool selection |
+| [Tool reference](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/tools.md) | Available tools and parameters, generated from the code |
+| [Architecture](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/architecture.md) | Tool execution, components and state |
+| [Security](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/security.md) | Sandbox boundaries, authentication and known limits |
+| [Extending](https://github.com/ajeetkharel/dev-link-mcp/blob/main/docs/extending.md) | Build and register your own tool groups |
+| [Changelog](https://github.com/ajeetkharel/dev-link-mcp/blob/main/CHANGELOG.md) | Release history and unreleased changes |
 
 ## Contributing
 
-See [CONTRIBUTING.md](https://github.com/ajeetkharel/dev-link-mcp/blob/main/CONTRIBUTING.md).
+Bug reports, documentation improvements and focused pull requests are welcome. Start with
+[CONTRIBUTING.md](https://github.com/ajeetkharel/dev-link-mcp/blob/main/CONTRIBUTING.md)
+for setup and checks. For larger changes, open an
+[issue](https://github.com/ajeetkharel/dev-link-mcp/issues) first to discuss the approach.
+Contributors follow the [Code of Conduct](https://github.com/ajeetkharel/dev-link-mcp/blob/main/CODE_OF_CONDUCT.md).
 
 ## License
 
-MIT License. See [LICENSE](https://github.com/ajeetkharel/dev-link-mcp/blob/main/LICENSE).
+[MIT](https://github.com/ajeetkharel/dev-link-mcp/blob/main/LICENSE).
