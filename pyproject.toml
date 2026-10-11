@@ -1,6 +1,6 @@
 [project]
 name = "dev-link-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Sandboxed, fully logged development environment for one folder that any MCP client, from coding agents to web chats, can use"
 readme = "README.md"
 requires-python = ">=3.11"
