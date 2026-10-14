@@ -9,6 +9,8 @@ format may change between minor releases; every such change is listed here.
 
 ## [Unreleased]
 
+## [0.3.0]
+
 ### Changed
 
 - `apply_patch` accepts the patch formats coding models write, not only unified diffs: OpenAI's
@@ -85,6 +87,7 @@ First public release.
   commands. A `--tunnel` server shuts down with exit status 1 when cloudflared exits, instead of
   running on with a dead public URL.
 
-[Unreleased]: https://github.com/ajeetkharel/dev-link-mcp/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/ajeetkharel/dev-link-mcp/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/ajeetkharel/dev-link-mcp/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ajeetkharel/dev-link-mcp/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ajeetkharel/dev-link-mcp/releases/tag/v0.1.0
