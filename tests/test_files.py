@@ -416,7 +416,8 @@ async def test_apply_patch_works_inside_git_repo(connect, workspace):
 
 async def test_apply_patch_requires_headers(connect):
     r = await call(connect, "apply_patch", {"patch": "just some text\n"})
-    assert r.is_error and "no file headers" in text(r)
+    assert r.is_error and "no patch found" in text(r)
+    assert "*** Begin Patch" in text(r) and "SEARCH/REPLACE" in text(r)
 
 
 @pytest.mark.bwrap
@@ -433,6 +434,210 @@ async def test_apply_patch_rejects_escaping_paths(connect, workspace, outside):
     r = await call(connect, "apply_patch", {"patch": patch})
     assert r.is_error and "outside the workspace" in text(r)
     assert outside.read_text() == "top secret\n"
+
+
+async def test_apply_patch_openai_format(connect, workspace):
+    (workspace / "view.tsx").write_text("class View {\n  render() {\n    return 1;\n  }\n}\n")
+    (workspace / "gone.txt").write_text("bye\n")
+    (workspace / "old.txt").write_text("a\nb\n")
+    patch = (
+        "*** Begin Patch\n"
+        "*** Update File: view.tsx\n"
+        "@@ class View {\n"
+        "@@   render() {\n"
+        "-    return 1;\n"
+        "+    return 2;\n"
+        "   }\n"
+        "*** Add File: src/new.ts\n"
+        "+export const x = 1;\n"
+        "*** Delete File: gone.txt\n"
+        "*** Update File: old.txt\n"
+        "*** Move to: moved/new.txt\n"
+        "@@\n"
+        " a\n"
+        "-b\n"
+        "+B\n"
+        "*** End Patch"
+    )
+    r = await call(connect, "apply_patch", {"patch": patch, "dry_run": True})
+    assert not r.is_error, text(r)
+    assert "applies cleanly" in text(r) and "moved old.txt -> moved/new.txt" in text(r)
+    assert not (workspace / "src").exists() and (workspace / "gone.txt").exists()
+
+    r = await call(connect, "apply_patch", {"patch": patch})
+    assert not r.is_error, text(r)
+    assert (workspace / "view.tsx").read_text() == "class View {\n  render() {\n    return 2;\n  }\n}\n"
+    assert (workspace / "src/new.ts").read_text() == "export const x = 1;\n"
+    assert not (workspace / "gone.txt").exists() and not (workspace / "old.txt").exists()
+    assert (workspace / "moved/new.txt").read_text() == "a\nB\n"
+
+
+async def test_apply_patch_openai_format_failure_changes_nothing(connect, workspace):
+    (workspace / "a.txt").write_text("one\n")
+    (workspace / "b.txt").write_text("two\n")
+    patch = (
+        "*** Begin Patch\n*** Update File: a.txt\n@@\n-one\n+ONE\n"
+        "*** Update File: b.txt\n@@\n-not there\n+x\n*** End Patch\n"
+    )
+    r = await call(connect, "apply_patch", {"patch": patch})
+    assert r.is_error and "nothing was changed" in text(r) and "b.txt" in text(r), text(r)
+    assert (workspace / "a.txt").read_text() == "one\n"
+
+
+async def test_apply_patch_openai_format_cut_off(connect, workspace):
+    (workspace / "a.txt").write_text("one\n")
+    r = await call(connect, "apply_patch", {"patch": "*** Begin Patch\n*** Update File: a.txt\n@@\n-one\n+ONE\n"})
+    assert r.is_error and "End Patch" in text(r)
+    assert (workspace / "a.txt").read_text() == "one\n"
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        # aider "diff": path, then a fenced block.
+        "app.py\n```python\n<<<<<<< SEARCH\nfrom flask import Flask\n=======\nimport math\nfrom flask import Flask\n"
+        ">>>>>>> REPLACE\n```\n",
+        # aider "diff-fenced": path inside the fence.
+        "```\napp.py\n<<<<<<< SEARCH\nfrom flask import Flask\n=======\nimport math\nfrom flask import Flask\n"
+        ">>>>>>> REPLACE\n```\n",
+        # Cline markers.
+        "app.py\n------- SEARCH\nfrom flask import Flask\n=======\nimport math\nfrom flask import Flask\n"
+        "+++++++ REPLACE\n",
+        # Roo Code line hint and separator.
+        "app.py\n<<<<<<< SEARCH\n:start_line:1\n-------\nfrom flask import Flask\n=======\nimport math\n"
+        "from flask import Flask\n>>>>>>> REPLACE\n",
+    ],
+    ids=["aider-diff", "aider-diff-fenced", "cline", "roo"],
+)
+async def test_apply_patch_search_replace_layouts(connect, workspace, patch):
+    (workspace / "app.py").write_text("from flask import Flask\napp = Flask(__name__)\n")
+    r = await call(connect, "apply_patch", {"patch": patch})
+    assert not r.is_error, text(r)
+    assert (workspace / "app.py").read_text() == "import math\nfrom flask import Flask\napp = Flask(__name__)\n"
+
+
+async def test_apply_patch_search_replace_several_blocks_and_new_file(connect, workspace):
+    (workspace / "a.py").write_text("x = 1\ny = 2\n")
+    patch = (
+        "a.py\n<<<<<<< SEARCH\nx = 1\n=======\nx = 10\n>>>>>>> REPLACE\n"
+        "<<<<<<< SEARCH\ny = 2\n=======\ny = 20\n>>>>>>> REPLACE\n"
+        "new/b.py\n<<<<<<< SEARCH\n=======\nprint('hi')\n>>>>>>> REPLACE\n"
+    )
+    r = await call(connect, "apply_patch", {"patch": patch})
+    assert not r.is_error, text(r)
+    assert (workspace / "a.py").read_text() == "x = 10\ny = 20\n"
+    assert (workspace / "new/b.py").read_text() == "print('hi')\n"
+    assert "added new/b.py" in text(r)
+
+
+async def test_apply_patch_search_replace_must_be_unique(connect, workspace):
+    (workspace / "a.py").write_text("x = 1\nx = 1\n")
+    patch = "a.py\n<<<<<<< SEARCH\nx = 1\n=======\nx = 2\n>>>>>>> REPLACE\n"
+    r = await call(connect, "apply_patch", {"patch": patch})
+    assert r.is_error and "matches 2 places" in text(r)
+    assert (workspace / "a.py").read_text() == "x = 1\nx = 1\n"
+
+
+async def test_apply_patch_unnumbered_hunks_without_prefixes(connect, workspace):
+    (workspace / "pkg").mkdir()
+    (workspace / "pkg/app.py").write_text("class MathWeb:\n    pass\n")
+    patch = (
+        "```diff\n--- pkg/app.py\n+++ pkg/app.py\n@@ ... @@\n-class MathWeb:\n+import sympy\n+\n+class MathWeb:\n```\n"
+    )
+    r = await call(connect, "apply_patch", {"patch": patch})
+    assert not r.is_error, text(r)
+    assert (workspace / "pkg/app.py").read_text() == "import sympy\n\nclass MathWeb:\n    pass\n"
+
+
+async def test_apply_patch_numbered_diff_without_prefixes_uses_strip_zero(connect, workspace):
+    (workspace / "hello.txt").write_text("one\ntwo\nthree\n")
+    patch = "--- hello.txt\n+++ hello.txt\n@@ -1,3 +1,3 @@\n one\n-two\n+zwei\n three\n"
+    r = await call(connect, "apply_patch", {"patch": patch})
+    assert not r.is_error, text(r)
+    assert (workspace / "hello.txt").read_text() == "one\nzwei\nthree\n"
+
+
+async def test_apply_patch_text_formats_reject_escaping_paths(connect, workspace, outside):
+    patches = [
+        "*** Begin Patch\n*** Update File: ../secret.txt\n@@\n-top secret\n+pwned\n*** End Patch\n",
+        "*** Begin Patch\n*** Add File: ../evil.txt\n+x\n*** End Patch\n",
+        "../secret.txt\n<<<<<<< SEARCH\ntop secret\n=======\npwned\n>>>>>>> REPLACE\n",
+        "--- ../secret.txt\n+++ ../secret.txt\n@@ @@\n-top secret\n+pwned\n",
+    ]
+    for patch in patches:
+        r = await call(connect, "apply_patch", {"patch": patch})
+        assert r.is_error and "outside the workspace" in text(r), text(r)
+    assert outside.read_text() == "top secret\n"
+    assert not (outside.parent / "evil.txt").exists()
+
+
+async def test_apply_patch_keeps_crlf_and_matches_loose_whitespace(connect, workspace):
+    (workspace / "w.txt").write_bytes(b"alpha  \r\n\tbeta\r\ngamma\r\n")
+    patch = "*** Begin Patch\n*** Update File: w.txt\n@@\n alpha\n-  beta\n+BETA\n*** End Patch\n"
+    r = await call(connect, "apply_patch", {"patch": patch})
+    assert not r.is_error, text(r)
+    assert (workspace / "w.txt").read_bytes() == b"alpha  \r\nBETA\r\ngamma\r\n"
+
+
+async def test_apply_patch_diff_of_a_file_holding_patch_text_edits_that_file(connect, workspace):
+    (workspace / "docs").mkdir()
+    (workspace / "docs/x.md").write_text("*** Begin Patch\n*** Update File: app.py\n    old\n*** End Patch\n")
+    (workspace / "app.py").write_text("def f():\n    old\n")
+    patch = (
+        "--- a/docs/x.md\n+++ b/docs/x.md\n@@ -1,4 +1,4 @@\n *** Begin Patch\n *** Update File: app.py\n"
+        "-    old\n+    new\n *** End Patch\n"
+    )
+    r = await call(connect, "apply_patch", {"patch": patch})
+    assert not r.is_error, text(r)
+    assert (workspace / "docs/x.md").read_text() == "*** Begin Patch\n*** Update File: app.py\n    new\n*** End Patch\n"
+    assert (workspace / "app.py").read_text() == "def f():\n    old\n"
+
+
+async def test_apply_patch_removed_comment_line_keeps_default_strip(connect, workspace):
+    (workspace / "q.sql").write_text("-- old comment\nselect 1;\n")
+    patch = "--- a/q.sql\n+++ b/q.sql\n@@ -1,2 +1,2 @@\n--- old comment\n+-- new comment\n select 1;\n"
+    r = await call(connect, "apply_patch", {"patch": patch})
+    assert not r.is_error, text(r)
+    assert (workspace / "q.sql").read_text() == "-- new comment\nselect 1;\n"
+
+
+async def test_apply_patch_move_of_missing_file_fails(connect, workspace):
+    patch = "*** Begin Patch\n*** Update File: missing.txt\n*** Move to: new.txt\n*** End Patch\n"
+    r = await call(connect, "apply_patch", {"patch": patch})
+    assert r.is_error and "does not exist" in text(r)
+    assert not (workspace / "new.txt").exists()
+
+
+@pytest.mark.parametrize(
+    ("setup", "second"),
+    [("dir", "*** Add File: d\n+x\n"), ("file", "*** Add File: f/g.txt\n+x\n")],
+    ids=["onto-directory", "under-file"],
+)
+async def test_apply_patch_checks_destinations_before_writing(connect, workspace, setup, second):
+    if setup == "dir":
+        (workspace / "d").mkdir()
+    else:
+        (workspace / "f").write_text("file\n")
+    patch = f"*** Begin Patch\n*** Add File: a.txt\n+hello\n{second}*** End Patch\n"
+    r = await call(connect, "apply_patch", {"patch": patch})
+    assert r.is_error and "nothing was changed" in text(r), text(r)
+    assert not (workspace / "a.txt").exists()
+
+
+async def test_apply_patch_invalid_unicode_writes_nothing(connect, workspace):
+    patch = "*** Begin Patch\n*** Add File: a.txt\n+ok\n*** Add File: b.txt\n+\ud800\n*** End Patch\n"
+    r = await call(connect, "apply_patch", {"patch": patch})
+    assert r.is_error and "UTF-8" in text(r), text(r)
+    assert not (workspace / "a.txt").exists()
+
+
+async def test_apply_patch_delete_removes_the_link_not_its_target(connect, workspace):
+    (workspace / "real.txt").write_text("keep\n")
+    (workspace / "link.txt").symlink_to("real.txt")
+    r = await call(connect, "apply_patch", {"patch": "*** Begin Patch\n*** Delete File: link.txt\n*** End Patch\n"})
+    assert not r.is_error, text(r)
+    assert not (workspace / "link.txt").is_symlink()
+    assert (workspace / "real.txt").read_text() == "keep\n"
 
 
 def test_patch_paths_ignores_removed_lines_that_look_like_headers():

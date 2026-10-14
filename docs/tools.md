@@ -56,15 +56,19 @@ Reading, writing, editing and organising files inside the workspace. On by defau
 
 ### `apply_patch`
 
-Apply a unified diff with `git apply`, also outside git repos. Patch paths are relative to
-the workspace root. Can create, delete and rename files; hunk line counts are recomputed, so
-slightly wrong @@ headers still apply. Nothing changes if any hunk fails.
+Apply a patch to files in the workspace. Accepts a unified diff (git diff or diff -u),
+OpenAI's `*** Begin Patch` format, or SEARCH/REPLACE blocks with the file path on the line
+before each block. A markdown fence around the whole patch is ignored. Unified diffs with
+numbered @@ headers go through `git apply` (also outside git repos; renames work and
+slightly wrong line counts still apply). Other patches are placed by their text, tolerating
+whitespace differences; a SEARCH part must match exactly one place. Paths are relative to
+the workspace root. Every change is checked before any file is written.
 
 | Parameter | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `patch` | string | yes | - | Unified diff (git diff or diff -u); may touch many files. |
+| `patch` | string | yes | - | The patch, in any of the formats listed above; may touch many files. |
 | `dry_run` | boolean | no | `false` | Only check that the patch applies; change nothing. |
-| `strip` | integer (>= 0, <= 10) | no | `1` | Leading path components to drop (1 for a/ and b/ prefixes). |
+| `strip` | integer (>= 0, <= 10) or null | no | `null` | Leading path components to drop from unified-diff paths. Default: 1 when they start with a/ and b/, else 0. |
 
 Returns text only.
 
