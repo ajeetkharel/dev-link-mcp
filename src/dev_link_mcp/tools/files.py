@@ -26,6 +26,17 @@ from pydantic import BaseModel, Field
 from dev_link_mcp.runtime import Runtime
 from dev_link_mcp.tools.base import ToolGroup
 from dev_link_mcp.tools.common import DESTRUCTIVE, READ_ONLY, WRITE, clip
+from dev_link_mcp.tools.patches import (
+    FileChange,
+    apply_hunks,
+    default_strip,
+    detect_format,
+    has_unnumbered_hunks,
+    parse_openai_patch,
+    parse_search_replace,
+    parse_unnumbered_diff,
+    unwrap,
+)
 from dev_link_mcp.workspace import read_at_most
 
 _IMAGE_TYPES = {
@@ -488,20 +499,112 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
         is left unchanged and the error names the edit. Returns a unified diff of the result."""
         return await in_thread(edit, path, edits)
 
-    @mcp.tool(annotations=DESTRUCTIVE)
-    async def apply_patch(
-        patch: Annotated[str, Field(description="Unified diff (git diff or diff -u); may touch many files.")],
-        dry_run: Annotated[bool, Field(description="Only check that the patch applies; change nothing.")] = False,
-        strip: Annotated[
-            int, Field(ge=0, le=10, description="Leading path components to drop (1 for a/ and b/ prefixes).")
-        ] = 1,
-    ) -> str:
-        """Apply a unified diff with `git apply`, also outside git repos. Patch paths are relative to
-        the workspace root. Can create, delete and rename files; hunk line counts are recomputed, so
-        slightly wrong @@ headers still apply. Nothing changes if any hunk fails."""
-        paths = patch_paths(patch, strip)
-        if not paths:
-            raise ToolError("no file headers found in the patch; expected '--- a/path' and '+++ b/path' lines")
+    def stage(changes: list[FileChange]) -> tuple[dict[Path, bytes | None], list[str]]:
+        """Work out the new bytes of every path the changes touch (None deletes it), writing nothing.
+
+        Changes apply in order, so a later section sees what an earlier one did to the same file.
+        Every check that a write could fail on (directories in the way, text that is not valid
+        UTF-8) happens here. Returns the staged contents and one summary line per change. Raises
+        ToolError naming the file when a change cannot be applied.
+        """
+        staged: dict[Path, bytes | None] = {}
+        summary: list[str] = []
+
+        def current(target: Path, rel: str) -> str | None:
+            if target in staged:
+                data = staged[target]
+                return None if data is None else data.decode("utf-8")
+            if not target.exists():
+                return None
+            if not target.is_file():
+                raise ToolError(f"{rel} is not a regular file")
+            with ws.open_file(target) as f:
+                return _read_text(f, rel)
+
+        def resolve(path: str) -> tuple[Path, str]:
+            target = ws.resolve(path)
+            if target == ws.root:
+                raise ToolError(f"patch path '{path}' is the workspace root, not a file")
+            return target, ws.rel(target)
+
+        def put(target: Path, rel: str, text: str) -> None:
+            if target.is_dir():
+                raise ToolError(f"{rel} is a directory")
+            parent = target.parent
+            while parent != ws.root and not parent.exists() and staged.get(parent) is None:
+                parent = parent.parent
+            if staged.get(parent) is not None or not parent.is_dir():
+                raise ToolError(f"cannot create {rel}: {ws.rel(parent)} is not a directory")
+            try:
+                staged[target] = text.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ToolError(f"{rel}: the patch text is not valid UTF-8 ({exc.reason})") from exc
+
+        def remove(path: str) -> str:
+            # The link itself is deleted, never what it points to, like delete_path.
+            entry = entry_path(path)
+            rel = ws.rel(entry)
+            if entry == ws.root:
+                raise ToolError(f"patch path '{path}' is the workspace root, not a file")
+            if entry in staged:
+                if staged[entry] is None:
+                    raise ToolError(f"cannot delete {rel}: an earlier section already removed it")
+            elif not entry.is_symlink():
+                if not entry.exists():
+                    raise ToolError(f"cannot delete {rel}: it does not exist")
+                if not entry.is_file():
+                    raise ToolError(f"cannot delete {rel}: it is not a regular file")
+            staged[entry] = None
+            return rel
+
+        for change in changes:
+            if change.action == "delete":
+                summary.append(f"deleted {remove(change.path)}")
+                continue
+            target, rel = resolve(change.path)
+            if change.action == "add":
+                put(target, rel, change.content)
+                summary.append(f"added {rel}")
+                continue
+            before = current(target, rel)
+            verb = "updated"
+            if before is None:
+                # Only SEARCH/REPLACE blocks with an empty SEARCH part may create a file.
+                if not change.hunks or any(hunk.old for hunk in change.hunks):
+                    raise ToolError(f"cannot update {rel}: it does not exist")
+                before, verb = "", "added"
+            after = apply_hunks(before, change.hunks, rel)
+            if change.move_to:
+                dest, dest_rel = resolve(change.move_to)
+                if dest != target:
+                    remove(change.path)
+                put(dest, dest_rel, after)
+                summary.append(f"moved {rel} -> {dest_rel}")
+            else:
+                put(target, rel, after)
+                summary.append(f"{verb} {rel}")
+        return staged, summary
+
+    def apply_changes(changes: list[FileChange], dry_run: bool) -> str:
+        with write_lock:
+            try:
+                staged, summary = stage(changes)
+            except ToolError as exc:
+                raise ToolError(f"patch does not apply; nothing was changed\n{exc}") from exc
+            if not dry_run:
+                for target, data in staged.items():
+                    if data is not None:
+                        ws.make_dirs(target.parent)
+                        ws.write_file(target, data)
+                for target, data in staged.items():
+                    if data is None and (target.exists() or target.is_symlink()):
+                        with ws.dir_fd(target.parent) as parent:
+                            os.unlink(target.name, dir_fd=parent)
+        verb = "applies cleanly to" if dry_run else "applied to"
+        listing = "\n".join(f"  {line}" for line in summary)
+        return f"patch {verb} {len(summary)} path(s):\n{listing}"
+
+    async def git_apply(patch: str, paths: list[str], strip: int, dry_run: bool) -> str:
         for p in paths:
             ws.resolve(p)
         root = ws.root
@@ -511,14 +614,60 @@ def _register(mcp: MCPServer, rt: Runtime) -> None:
         argv.append("-")
         # Stop git from finding a repository above the workspace when the sandbox is off.
         env = {"GIT_CEILING_DIRECTORIES": str(root.parent)}
-        body = patch if patch.endswith("\n") else patch + "\n"
-        result = await rt.sandbox.run(argv, cwd=root, stdin=body, timeout_s=60, env=env)
+        result = await rt.sandbox.run(argv, cwd=root, stdin=patch, timeout_s=60, env=env)
         output = (result.stderr + result.stdout).strip()
         if not result.ok:
             raise ToolError(f"patch does not apply; nothing was changed\n{clip(output, limits.max_output_bytes)}")
         verb = "applies cleanly to" if dry_run else "applied to"
         listing = "\n".join(f"  {p}" for p in paths)
         return f"patch {verb} {len(paths)} path(s):\n{listing}\n{clip(output, limits.max_output_bytes)}".rstrip()
+
+    @mcp.tool(annotations=DESTRUCTIVE)
+    async def apply_patch(
+        patch: Annotated[
+            str, Field(description="The patch, in any of the formats listed above; may touch many files.")
+        ],
+        dry_run: Annotated[bool, Field(description="Only check that the patch applies; change nothing.")] = False,
+        strip: Annotated[
+            int | None,
+            Field(
+                ge=0,
+                le=10,
+                description="Leading path components to drop from unified-diff paths. "
+                "Default: 1 when they start with a/ and b/, else 0.",
+            ),
+        ] = None,
+    ) -> str:
+        """Apply a patch to files in the workspace. Accepts a unified diff (git diff or diff -u),
+        OpenAI's `*** Begin Patch` format, or SEARCH/REPLACE blocks with the file path on the line
+        before each block. A markdown fence around the whole patch is ignored. Unified diffs with
+        numbered @@ headers go through `git apply` (also outside git repos; renames work and
+        slightly wrong line counts still apply). Other patches are placed by their text, tolerating
+        whitespace differences; a SEARCH part must match exactly one place. Paths are relative to
+        the workspace root. Every change is checked before any file is written."""
+        text = unwrap(patch)
+        kind = detect_format(text)
+        levels = 0
+        if kind is None or kind == "unified":
+            levels = default_strip(text) if strip is None else strip
+            paths = patch_paths(text, levels)
+            if not paths:
+                raise ToolError(
+                    "no patch found. Send a unified diff ('--- a/path', '+++ b/path', '@@' hunks), "
+                    "OpenAI's '*** Begin Patch' format, or SEARCH/REPLACE blocks after a file path line"
+                )
+            if not has_unnumbered_hunks(text):
+                return await git_apply(text, paths, levels, dry_run)
+        try:
+            if kind == "openai":
+                changes = parse_openai_patch(text)
+            elif kind == "search_replace":
+                changes = parse_search_replace(text)
+            else:
+                changes = parse_unnumbered_diff(text, levels)
+        except ToolError as exc:
+            raise ToolError(f"could not read the patch; nothing was changed\n{exc}") from exc
+        return await in_thread(apply_changes, changes, dry_run)
 
     @mcp.tool(annotations=READ_ONLY)
     async def list_dir(

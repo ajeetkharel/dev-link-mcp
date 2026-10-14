@@ -9,6 +9,15 @@ format may change between minor releases; every such change is listed here.
 
 ## [Unreleased]
 
+### Changed
+
+- `apply_patch` accepts the patch formats coding models write, not only unified diffs: OpenAI's
+  `*** Begin Patch` format (ChatGPT, Codex, Cline), SEARCH/REPLACE blocks (aider, Cline, Roo
+  Code), unified diffs with bare `@@` hunk headers, and any of these wrapped in a markdown fence.
+  Unified diffs with numbered hunks still go through `git apply`.
+- `apply_patch` `strip` defaults to 1 only when the diff paths start with `a/` and `b/`, and to 0
+  otherwise, so `--- file` / `+++ file` diffs apply without setting it.
+
 ## [0.2.0]
 
 ### Added
